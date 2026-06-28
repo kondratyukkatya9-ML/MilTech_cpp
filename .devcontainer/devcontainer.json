@@ -1,0 +1,67 @@
+{
+  "name": "CPP MilTech",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "WORKSPACE_FOLDER": "${localEnv:HOME}/${localWorkspaceFolderBasename}",
+      "CONTAINER_USER": "${localEnv:USER}"
+    }
+  },
+  "remoteUser": "${localEnv:USER}",
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localEnv:HOME}/${localWorkspaceFolderBasename},type=bind",
+  "workspaceFolder": "${localEnv:HOME}/${localWorkspaceFolderBasename}",
+  "mounts": [
+    "source=${localEnv:HOME}/.ssh,target=/home/${localEnv:USER}/.ssh,type=bind,readonly,consistency=cached",
+    "source=${localEnv:HOME}/.devcontainers/${localWorkspaceFolderBasename}/.bash_history,target=/home/${localEnv:USER}/.bash_history,type=bind,consistency=delegated",
+  ],
+  "initializeCommand": [
+    ".devcontainer/scripts/initialize"
+  ],
+  "runArgs": [
+    "--network=host",
+    "--hostname=devcontainer",
+    "--add-host=devcontainer:127.0.1.1"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "josetr.cmake-language-support-vscode",
+        "cheshirekow.cmake-format",
+        "ms-vscode.cpptools",
+        "llvm-vs-code-extensions.vscode-clangd"
+      ],
+      "settings": {
+        "clangd.path": "/usr/bin/clangd",
+        "clangd.arguments": [
+          "--compile-commands-dir=ada_ws/build/x86_64/",
+          "--clang-tidy",
+          "--background-index"
+        ],
+        "clangd.restartAfterCrash": true,
+        "C_Cpp.intelliSenseEngine": "disabled",
+        "[cpp]": {
+          "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+          "editor.quickSuggestions": {
+            "other": "on",
+            "comments": "off",
+            "strings": "off"
+          }
+        },
+        "[cmake]": {
+          "editor.defaultFormatter": "cheshirekow.cmake-format"
+        },
+        "cmakeFormat.args": [
+          "--config-file=/.cmake-format.json"
+        ],
+        "cmakeFormat.exePath": "/usr/bin/cmake-format"
+      }
+    },
+    "terminal.integrated.shell.linux": "bash",
+    "terminal.integrated.profiles.linux": {
+      "bash (container default)": {
+        "path": "/bin/bash",
+        "overrideName": true
+      }
+    }
+  }
+}
