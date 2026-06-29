@@ -3,6 +3,7 @@
 #include "json.hpp" 
 #include <fstream>
 #include <cstring>
+#include <memory>
 using json = nlohmann::json;
 
 
@@ -233,7 +234,7 @@ int main() {
 
     int ammoCount = ja.size();      
 
-    AmmoParams* ammo = new AmmoParams[ammoCount];  
+    std::unique_ptr<AmmoParams[]> ammo(new AmmoParams[ammoCount]);  
     for (int i = 0; i < ammoCount; ++i) {
         ammo[i].mass = ja[i]["mass"];
         ammo[i].drag = ja[i]["drag"];
@@ -269,7 +270,6 @@ for (int i = 0; i < ammoCount; i++) {
 }
 if (bombIdx == -1) {
     std::cerr << "Unknown ammo: " << config.ammoName << std::endl;
-    delete[] ammo;
     delete[] targets;
     return 1;
 }
@@ -377,7 +377,6 @@ LOG("simulation.json written");
 delete[] steps;
 steps = nullptr;
 
-delete[] ammo;
 ammo = nullptr;
 
 for (int i = 0; i < tgtCount; i++)
