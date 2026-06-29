@@ -103,6 +103,7 @@ enum DroneState {
     TURNING,
     MOVING
 };
+
 Coord interpolateTarget(Coord** targets, int targetIdx, 
                          float t, float arrayTimeStep, int timeSteps) {
     int idx  = (int)(t / arrayTimeStep) % timeSteps;
@@ -250,7 +251,7 @@ int main() {
     int tgtCount  = jt["targetCount"];
     int timeSteps = jt["timeSteps"];
 
-    Coord** targets = new Coord*[tgtCount];
+    std::unique_ptr<Coord*[]> targets(new Coord*[tgtCount]);
 for (int i = 0; i < tgtCount; i++) { 
     targets[i] = new Coord[timeSteps];
     for (int j = 0; j < timeSteps; j++) {
@@ -270,7 +271,7 @@ for (int i = 0; i < ammoCount; i++) {
 }
 if (bombIdx == -1) {
     std::cerr << "Unknown ammo: " << config.ammoName << std::endl;
-    delete[] targets;
+    
     return 1;
 }
 LOG("Ammo found: " << ammo[bombIdx].name);
@@ -286,7 +287,7 @@ float accel = (config.attackSpeed * config.attackSpeed) / (2.0f * config.accelPa
 
 // Динамічний масив кроків симуляції
 const int MAX_STEPS = 10000;
-SimStep* steps = new SimStep[MAX_STEPS];
+std::unique_ptr<SimStep[]> steps(new SimStep[MAX_STEPS]);
 int stepCount = 0;
 
 // Основний цикл симуляції
@@ -295,12 +296,12 @@ while (stepCount < MAX_STEPS) {
     int bestTarget = -1;
 
     for (int i = 0; i < tgtCount; i++) {
-        Coord tPos = interpolateTarget(targets, i, currentTime, config.arrayTimeStep, timeSteps);
+        Coord tPos = interpolateTarget(targets.get(), i, currentTime, config.arrayTimeStep, timeSteps);
         float ft = calcFlightTime(config.altitude, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
         if (ft < 0) continue;
 
         float dt = config.simTimeStep;
-        Coord tNext = interpolateTarget(targets, i, currentTime + dt, config.arrayTimeStep, timeSteps);
+        Coord tNext = interpolateTarget(targets.get(), i, currentTime + dt, config.arrayTimeStep, timeSteps);
         Coord tVel = (tNext - tPos) * (1.0f / dt);
         Coord predicted = tPos + tVel * ft;
 
@@ -318,10 +319,10 @@ while (stepCount < MAX_STEPS) {
     }
     currentTarget = bestTarget;
 
-    Coord tPos = interpolateTarget(targets, currentTarget, currentTime, config.arrayTimeStep, timeSteps);
+    Coord tPos = interpolateTarget(targets.get(), currentTarget, currentTime, config.arrayTimeStep, timeSteps);
     float ft = calcFlightTime(config.altitude, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
     float h = calcHorizDist(ft, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
-    Coord tNext = interpolateTarget(targets, currentTarget, currentTime + config.simTimeStep, config.arrayTimeStep, timeSteps);
+    Coord tNext = interpolateTarget(targets.get(), currentTarget, currentTime + config.simTimeStep, config.arrayTimeStep, timeSteps);
     Coord tVel = (tNext - tPos) * (1.0f / config.simTimeStep);
     Coord predicted = tPos + tVel * ft;
     Coord firePoint = calcFirePoint(dronePos, predicted, h, config.accelPath);
@@ -374,14 +375,9 @@ LOG("simulation.json written");
 
 // Звільнення пам'яті
 
-delete[] steps;
-steps = nullptr;
-
-ammo = nullptr;
 
 for (int i = 0; i < tgtCount; i++)
     delete[] targets[i];
-delete[] targets;
-targets = nullptr;
+
     return 0;
 }
