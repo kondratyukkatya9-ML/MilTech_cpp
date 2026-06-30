@@ -103,6 +103,119 @@ enum DroneState {
     TURNING,
     MOVING
 };
+struct DroneContext {
+    Coord dronePos;
+    float droneDir;
+    float droneSpeed;
+    DroneState droneState;
+
+    float newDir;
+    float deltaAngle;
+
+    float attackSpeed;
+    float accel;
+    float angularSpeed;
+    float turnThreshold;
+    float simTimeStep;
+};
+class IDroneState {
+public:
+    virtual ~IDroneState() = default;
+    virtual std::unique_ptr<IDroneState> execute(DroneContext& ctx) = 0;
+    virtual const char* name() const = 0;
+};
+
+
+
+
+class StateStopped;
+class StateAccelerating;
+class StateDecelerating;
+class StateTurning;
+class StateMoving;
+
+class StateStopped : public IDroneState {
+public:
+    std::unique_ptr<IDroneState> execute(DroneContext& ctx) override;
+    const char* name() const override { return "Stopped"; }
+};
+
+class StateAccelerating : public IDroneState {
+public:
+    std::unique_ptr<IDroneState> execute(DroneContext& ctx) override;
+    const char* name() const override { return "Accelerating"; }
+};
+
+class StateDecelerating : public IDroneState {
+public:
+    std::unique_ptr<IDroneState> execute(DroneContext& ctx) override;
+    const char* name() const override { return "Decelerating"; }
+};
+
+class StateTurning : public IDroneState {
+public:
+    std::unique_ptr<IDroneState> execute(DroneContext& ctx) override;
+    const char* name() const override { return "Turning"; }
+};
+
+class StateMoving : public IDroneState {
+public:
+    std::unique_ptr<IDroneState> execute(DroneContext& ctx) override;
+    const char* name() const override { return "Moving"; }
+};
+
+std::unique_ptr<IDroneState> StateStopped::execute(DroneContext& ctx) {
+    ctx.droneDir = ctx.newDir;
+    return std::make_unique<StateAccelerating>();
+}
+
+std::unique_ptr<IDroneState> StateAccelerating::execute(DroneContext& ctx) {
+    ctx.droneSpeed += ctx.accel * ctx.simTimeStep;
+    if (ctx.droneSpeed >= ctx.attackSpeed) {
+        ctx.droneSpeed = ctx.attackSpeed;
+        ctx.dronePos.x += ctx.droneSpeed * cosf(ctx.droneDir) * ctx.simTimeStep;
+        ctx.dronePos.y += ctx.droneSpeed * sinf(ctx.droneDir) * ctx.simTimeStep;
+        return std::make_unique<StateMoving>();
+    }
+    ctx.dronePos.x += ctx.droneSpeed * cosf(ctx.droneDir) * ctx.simTimeStep;
+    ctx.dronePos.y += ctx.droneSpeed * sinf(ctx.droneDir) * ctx.simTimeStep;
+    return nullptr;
+}
+
+std::unique_ptr<IDroneState> StateMoving::execute(DroneContext& ctx) {
+    if (fabsf(ctx.deltaAngle) > ctx.turnThreshold) {
+        ctx.dronePos.x += ctx.droneSpeed * cosf(ctx.droneDir) * ctx.simTimeStep;
+        ctx.dronePos.y += ctx.droneSpeed * sinf(ctx.droneDir) * ctx.simTimeStep;
+        return std::make_unique<StateDecelerating>();
+    }
+    ctx.droneDir = ctx.newDir;
+    ctx.dronePos.x += ctx.droneSpeed * cosf(ctx.droneDir) * ctx.simTimeStep;
+    ctx.dronePos.y += ctx.droneSpeed * sinf(ctx.droneDir) * ctx.simTimeStep;
+    return nullptr;
+}
+
+std::unique_ptr<IDroneState> StateDecelerating::execute(DroneContext& ctx) {
+    ctx.droneSpeed -= ctx.accel * ctx.simTimeStep;
+    if (ctx.droneSpeed <= 0) {
+        ctx.droneSpeed = 0;
+        return std::make_unique<StateTurning>();
+    }
+    ctx.dronePos.x += ctx.droneSpeed * cosf(ctx.droneDir) * ctx.simTimeStep;
+    ctx.dronePos.y += ctx.droneSpeed * sinf(ctx.droneDir) * ctx.simTimeStep;
+    return nullptr;
+}
+
+std::unique_ptr<IDroneState> StateTurning::execute(DroneContext& ctx) {
+    float turnAmount = ctx.angularSpeed * ctx.simTimeStep;
+    if (fabsf(ctx.deltaAngle) <= turnAmount) {
+        ctx.droneDir = ctx.newDir;
+        return std::make_unique<StateAccelerating>();
+    }
+    ctx.droneDir += (ctx.deltaAngle > 0) ? turnAmount : -turnAmount;
+    return nullptr;
+}
+
+
 
 Coord interpolateTarget(Coord** targets, int targetIdx, 
                          float t, float arrayTimeStep, int timeSteps) {
