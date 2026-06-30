@@ -4,6 +4,7 @@
 #include <fstream>
 #include <cstring>
 #include <memory>
+#include <string>
 using json = nlohmann::json;
 
 
@@ -91,6 +92,7 @@ struct SimStep {
     Coord pos;
     float direction;
     int   state;
+    std::string stateName;
     int   targetIdx;
     Coord dropPoint;
     Coord aimPoint;
@@ -393,7 +395,7 @@ LOG("Ammo found: " << ammo[bombIdx].name);
 Coord dronePos = config.startPos;
 float droneDir = config.initialDir;
 float droneSpeed = 0.0f;
-DroneState droneState = STOPPED;
+std::unique_ptr<IDroneState> droneState = std::make_unique<StateStopped>();
 float currentTime = 0.0f;
 int currentTarget = -1;
 float accel = (config.attackSpeed * config.attackSpeed) / (2.0f * config.accelPath);
@@ -421,8 +423,7 @@ while (stepCount < MAX_STEPS) {
         float h = calcHorizDist(ft, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
         Coord firePoint = calcFirePoint(dronePos, predicted, h, config.accelPath);
         float dist = length(firePoint - dronePos);
-
-        float timeToStop = (i != currentTarget) ? calcTimeToStop(droneState, droneSpeed, config.attackSpeed, accel) : 0.0f;
+        float timeToStop = 0.0f; 
         float totalTime = ft + dist / config.attackSpeed + timeToStop;
 
         if (bestTime < 0 || totalTime < bestTime) {
@@ -445,22 +446,37 @@ while (stepCount < MAX_STEPS) {
     while (deltaAngle >  3.14159f) deltaAngle -= 2*3.14159f;
     while (deltaAngle < -3.14159f) deltaAngle += 2*3.14159f;
 
-    // Заповнюємо крок симуляції
+// Заповнюємо крок симуляції
     steps[stepCount].pos             = dronePos;
     steps[stepCount].direction       = droneDir;
-    steps[stepCount].state           = (int)droneState;
+    steps[stepCount].stateName = droneState->name();
     steps[stepCount].targetIdx       = currentTarget;
     steps[stepCount].dropPoint       = firePoint;
     steps[stepCount].aimPoint        = dronePos + Coord{cosf(droneDir), sinf(droneDir)} * h;
     steps[stepCount].predictedTarget = predicted;
 
-    updateDrone(dronePos, droneDir, droneSpeed, droneState,
-                newDir, deltaAngle, config.attackSpeed, accel,
-                config.angularSpeed, config.turnThreshold, config.simTimeStep);
+    DroneContext ctx;
+    ctx.dronePos       = dronePos;
+    ctx.droneDir       = droneDir;
+    ctx.droneSpeed     = droneSpeed;
+    ctx.newDir         = newDir;
+    ctx.deltaAngle     = deltaAngle;
+    ctx.attackSpeed    = config.attackSpeed;
+    ctx.accel          = accel;
+    ctx.angularSpeed   = config.angularSpeed;
+    ctx.turnThreshold  = config.turnThreshold;
+    ctx.simTimeStep    = config.simTimeStep;
+
+    auto next = droneState->execute(ctx);
+    if (next) droneState = std::move(next);
+
+    dronePos   = ctx.dronePos;
+    droneDir   = ctx.droneDir;
+    droneSpeed = ctx.droneSpeed;
+    
 
     float distToFire = length(firePoint - dronePos);
-    if (distToFire <= config.hitRadius && droneState == MOVING) break;
-
+    if (distToFire <= config.hitRadius && droneState->name() == std::string("Moving")) break;
     stepCount++;
     currentTime += config.simTimeStep;
 }
@@ -474,7 +490,7 @@ for (int i = 0; i < stepCount; i++) {
     json step;
     step["position"]        = {{"x", steps[i].pos.x}, {"y", steps[i].pos.y}};
     step["direction"]       = steps[i].direction;
-    step["state"]           = steps[i].state;
+    step["state"] = steps[i].stateName;
     step["targetIndex"]     = steps[i].targetIdx;
     step["dropPoint"]       = {{"x", steps[i].dropPoint.x}, {"y", steps[i].dropPoint.y}};
     step["aimPoint"]        = {{"x", steps[i].aimPoint.x}, {"y", steps[i].aimPoint.y}};
