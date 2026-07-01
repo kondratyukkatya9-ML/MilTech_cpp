@@ -120,6 +120,107 @@ struct DroneContext {
     float turnThreshold;
     float simTimeStep;
 };
+
+struct BallisticTable {
+    std::vector<float> axisZ0;
+    std::vector<float> axisV0;
+    std::vector<float> axisM;
+    std::vector<float> axisD;
+    std::vector<float> axisL;
+
+    struct Result {
+        float t;
+        float hDist;
+    };
+
+    std::vector<Result> data;
+
+    size_t index(int iz, int iv, int im, int id, int il) const {
+        return ((((size_t)iz * axisV0.size() + iv)
+                              * axisM.size()  + im)
+                              * axisD.size()  + id)
+                              * axisL.size()  + il;
+    }
+
+    const Result& at(int iz, int iv, int im, int id, int il) const {
+        return data[index(iz, iv, im, id, il)];
+    }
+
+    bool load(const char* path) {
+        std::ifstream f(path);
+        if (!f.is_open()) return false;
+
+        int nZ, nV, nM, nD, nL;
+        f >> nZ >> nV >> nM >> nD >> nL;
+
+        axisZ0.resize(nZ); for (auto& v : axisZ0) f >> v;
+        axisV0.resize(nV); for (auto& v : axisV0) f >> v;
+        axisM.resize(nM);  for (auto& v : axisM)  f >> v;
+        axisD.resize(nD);  for (auto& v : axisD)  f >> v;
+        axisL.resize(nL);  for (auto& v : axisL)  f >> v;
+
+        size_t total = (size_t)nZ*nV*nM*nD*nL;
+        data.resize(total);
+
+        for (size_t i = 0; i < total; i++)
+            f >> data[i].t >> data[i].hDist;
+
+        return f.good();
+    }
+    struct Interp {
+    int lo;
+    float frac;
+};
+
+Interp findInterp(float val, const std::vector<float>& axis) const {
+    if (val <= axis.front()) return {0, 0.0f};
+    if (val >= axis.back())  return {(int)axis.size()-2, 1.0f};
+    int i = 0;
+    for (int j = 0; j < (int)axis.size()-1; j++)
+        if (axis[j] <= val && val <= axis[j+1]) { i = j; break; }
+    float frac = (val - axis[i]) / (axis[i+1] - axis[i]);
+    return {i, frac};
+}
+
+Result lerp(const Result& a, const Result& b, float t) const {
+    return {a.t + (b.t - a.t) * t, a.hDist + (b.hDist - a.hDist) * t};
+}
+
+Result lookup(float Z0, float V0, float m, float d, float l) const {
+    Interp iz = findInterp(Z0, axisZ0);
+    Interp iv = findInterp(V0, axisV0);
+    Interp im = findInterp(m,  axisM);
+    Interp id = findInterp(d,  axisD);
+    Interp il = findInterp(l,  axisL);
+
+    Result v[16];
+    for (int a = 0; a < 2; a++)
+    for (int b = 0; b < 2; b++)
+    for (int c = 0; c < 2; c++)
+    for (int e = 0; e < 2; e++) {
+        auto& lo = at(iz.lo+a, iv.lo+b, im.lo+c, id.lo+e, il.lo);
+        auto& hi = at(iz.lo+a, iv.lo+b, im.lo+c, id.lo+e, il.lo+1);
+        v[a*8+b*4+c*2+e] = lerp(lo, hi, il.frac);
+    }
+    Result w[8];
+    for (int a = 0; a < 2; a++)
+    for (int b = 0; b < 2; b++)
+    for (int c = 0; c < 2; c++)
+        w[a*4+b*2+c] = lerp(v[a*8+b*4+c*2], v[a*8+b*4+c*2+1], id.frac);
+
+    Result u[4];
+    for (int a = 0; a < 2; a++)
+    for (int b = 0; b < 2; b++)
+        u[a*2+b] = lerp(w[a*4+b*2], w[a*4+b*2+1], im.frac);
+
+    Result s[2];
+    for (int a = 0; a < 2; a++)
+        s[a] = lerp(u[a*2], u[a*2+1], iv.frac);
+
+    return lerp(s[0], s[1], iz.frac);
+}
+};
+
 class IDroneState {
 public:
     virtual ~IDroneState() = default;
@@ -328,6 +429,8 @@ int main() {
     json jc;
     fc >> jc;
 
+
+
     DroneConfig config;
     config.startPos.x   = jc["drone"]["position"]["x"];
     config.startPos.y   = jc["drone"]["position"]["y"];
@@ -358,6 +461,13 @@ int main() {
         std::strncpy(ammo[i].name, ja[i]["name"].get<std::string>().c_str(), 31);
     }
     LOG("Ammo loaded: " << ammoCount << " types");
+
+    BallisticTable table;
+if (!table.load("ballistic_table.txt")) {
+    std::cerr << "Cannot open ballistic_table.txt" << std::endl;
+    return 1;
+}
+LOG("Ballistic table loaded");
 
     std::ifstream ft("targets.json");
     json jt;
@@ -412,15 +522,16 @@ while (stepCount < MAX_STEPS) {
 
     for (int i = 0; i < tgtCount; i++) {
         Coord tPos = interpolateTarget(targets.get(), i, currentTime, config.arrayTimeStep, timeSteps);
-        float ft = calcFlightTime(config.altitude, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
-        if (ft < 0) continue;
+        
 
         float dt = config.simTimeStep;
         Coord tNext = interpolateTarget(targets.get(), i, currentTime + dt, config.arrayTimeStep, timeSteps);
         Coord tVel = (tNext - tPos) * (1.0f / dt);
+        auto res = table.lookup(config.altitude, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
+        float ft = res.t;
+        float h = res.hDist;
         Coord predicted = tPos + tVel * ft;
 
-        float h = calcHorizDist(ft, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
         Coord firePoint = calcFirePoint(dronePos, predicted, h, config.accelPath);
         float dist = length(firePoint - dronePos);
         float timeToStop = 0.0f; 
@@ -434,9 +545,10 @@ while (stepCount < MAX_STEPS) {
     currentTarget = bestTarget;
 
     Coord tPos = interpolateTarget(targets.get(), currentTarget, currentTime, config.arrayTimeStep, timeSteps);
-    float ft = calcFlightTime(config.altitude, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
-    float h = calcHorizDist(ft, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
     Coord tNext = interpolateTarget(targets.get(), currentTarget, currentTime + config.simTimeStep, config.arrayTimeStep, timeSteps);
+    auto res = table.lookup(config.altitude, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
+    float ft = res.t;
+    float h = res.hDist;
     Coord tVel = (tNext - tPos) * (1.0f / config.simTimeStep);
     Coord predicted = tPos + tVel * ft;
     Coord firePoint = calcFirePoint(dronePos, predicted, h, config.accelPath);
