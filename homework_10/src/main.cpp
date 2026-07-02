@@ -438,6 +438,8 @@ struct DroneTelemetry {
 
 class DronePhysics {
 private:
+    mutable std::mutex mtx_;
+
     Coord dronePos_;
     float droneDir_;
     float droneSpeed_;
@@ -497,6 +499,7 @@ public:
 
     // Поточна телеметрія — позиція, швидкість, час оновлення
     DroneTelemetry getTelemetry() const {
+        std::lock_guard<std::mutex> lock(mtx_);
         DroneTelemetry t;
         t.pos = dronePos_;
         t.speed = Coord{ droneSpeed_ * cosf(droneDir_), droneSpeed_ * sinf(droneDir_) };
@@ -505,8 +508,12 @@ public:
     }
 
     // Поточний напрямок і назва стану 
-    float getDirection() const { return droneDir_; }
-    const char* getStateName() const { return droneState_->name(); }
+    float getDirection() const { 
+        std::lock_guard<std::mutex> lock(mtx_);
+        return droneDir_; }
+    const char* getStateName() const { 
+        std::lock_guard<std::mutex> lock(mtx_);
+        return droneState_->name(); }
 };
 
 //ThreadSafeTargetProvider
