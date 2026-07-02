@@ -5,6 +5,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <mutex>
 using json = nlohmann::json;
 
 
@@ -512,12 +513,13 @@ public:
 
 class ThreadSafeTargetProvider {
 private:
-    std::unique_ptr<Coord*[]> trajectories_;  
+    std::unique_ptr<Coord*[]> trajectories_;
     int targetCount_;
     int timeSteps_;
     float arrayTimeStep_;
 
-    std::unique_ptr<Target[]> currentTargets_;  // поточний знімок кожної цілі
+    mutable std::mutex mtx_;
+    std::unique_ptr<Target[]> currentTargets_;
 
 public:
     ThreadSafeTargetProvider(const char* path) {
@@ -531,7 +533,7 @@ public:
 
         targetCount_   = jt["targetCount"];
         timeSteps_     = jt["timeSteps"];
-        arrayTimeStep_ = 1.0f;  
+        arrayTimeStep_ = 1.0f;
 
         trajectories_.reset(new Coord*[targetCount_]);
         for (int i = 0; i < targetCount_; i++) {
@@ -552,7 +554,6 @@ public:
 
     void setArrayTimeStep(float step) { arrayTimeStep_ = step; }
 
-    // Один крок: оновлення позиція+швидкість кожної цілі на момент currentTime
     void step(float currentTime) {
         float dt = arrayTimeStep_;
         for (int i = 0; i < targetCount_; i++) {
@@ -560,6 +561,7 @@ public:
             Coord next = interpolateTarget(trajectories_.get(), i, currentTime + dt, arrayTimeStep_, timeSteps_);
             Coord vel  = (next - pos) * (1.0f / dt);
 
+            std::lock_guard<std::mutex> lock(mtx_);
             currentTargets_[i].pos      = pos;
             currentTargets_[i].velocity = vel;
         }
@@ -567,8 +569,14 @@ public:
 
     int getTargetCount() const { return targetCount_; }
 
-    Target getTarget(int idx) const { return currentTargets_[idx]; }
+    Target getTarget(int idx) const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return currentTargets_[idx];
+    }
 };
+        
+
+   
 int main() {
     // Читаємо config.json
     std::ifstream fc("config.json");
