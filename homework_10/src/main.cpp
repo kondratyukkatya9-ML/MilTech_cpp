@@ -418,6 +418,90 @@ void updateDrone(Coord& dronePos, float& droneDir,
         }
     }
 }
+// ==================== ДЗ10: DronePhysics ====================
+
+struct DroneCommand {
+    float desiredDir;  // бажаний напрямок польоту
+};
+
+struct DroneTelemetry {
+    Coord pos;
+    Coord speed;
+    float timeSecSinceStart;
+};
+
+class DronePhysics {
+private:
+    Coord dronePos_;
+    float droneDir_;
+    float droneSpeed_;
+    std::unique_ptr<IDroneState> droneState_;
+    float desiredDir_ = 0.0f;
+
+    float accel_;
+    float angularSpeed_;
+    float turnThreshold_;
+    float attackSpeed_;
+
+public:
+    DronePhysics(Coord startPos, float initialDir, float accel,
+                 float angularSpeed, float turnThreshold, float attackSpeed)
+        : dronePos_(startPos)
+        , droneDir_(initialDir)
+        , droneSpeed_(0.0f)
+        , droneState_(std::make_unique<StateStopped>())
+        , desiredDir_(initialDir)
+        , accel_(accel)
+        , angularSpeed_(angularSpeed)
+        , turnThreshold_(turnThreshold)
+        , attackSpeed_(attackSpeed)
+
+    {}
+
+    
+    void setCommand(const DroneCommand& cmd) {
+        desiredDir_ = cmd.desiredDir;
+    }
+
+    // Один крок фізики: dt секунд часу
+    void step(float dt) {
+        float deltaAngle = desiredDir_ - droneDir_;
+        while (deltaAngle >  3.14159f) deltaAngle -= 2*3.14159f;
+        while (deltaAngle < -3.14159f) deltaAngle += 2*3.14159f;
+
+        DroneContext ctx;
+        ctx.dronePos      = dronePos_;
+        ctx.droneDir      = droneDir_;
+        ctx.droneSpeed    = droneSpeed_;
+        ctx.newDir        = desiredDir_;
+        ctx.deltaAngle    = deltaAngle;
+        ctx.attackSpeed   = attackSpeed_;   
+        ctx.accel         = accel_;
+        ctx.angularSpeed  = angularSpeed_;
+        ctx.turnThreshold = turnThreshold_;
+        ctx.simTimeStep   = dt;
+
+        auto next = droneState_->execute(ctx);
+        if (next) droneState_ = std::move(next);
+
+        dronePos_   = ctx.dronePos;
+        droneDir_   = ctx.droneDir;
+        droneSpeed_ = ctx.droneSpeed;
+    }
+
+    // Поточна телеметрія — позиція, швидкість, час оновлення
+    DroneTelemetry getTelemetry() const {
+        DroneTelemetry t;
+        t.pos = dronePos_;
+        t.speed = Coord{ droneSpeed_ * cosf(droneDir_), droneSpeed_ * sinf(droneDir_) };
+        t.timeSecSinceStart = 0.0f;  
+        return t;
+    }
+
+    // Поточний напрямок і назва стану 
+    float getDirection() const { return droneDir_; }
+    const char* getStateName() const { return droneState_->name(); }
+};
 
 int main() {
     // Читаємо config.json
@@ -502,13 +586,13 @@ if (bombIdx == -1) {
 LOG("Ammo found: " << ammo[bombIdx].name);
 
 // Ініціалізація дрона
-Coord dronePos = config.startPos;
-float droneDir = config.initialDir;
-float droneSpeed = 0.0f;
-std::unique_ptr<IDroneState> droneState = std::make_unique<StateStopped>();
+float accel = (config.attackSpeed * config.attackSpeed) / (2.0f * config.accelPath);
+
+DronePhysics physics(config.startPos, config.initialDir, accel,
+                      config.angularSpeed, config.turnThreshold, config.attackSpeed);
+
 float currentTime = 0.0f;
 int currentTarget = -1;
-float accel = (config.attackSpeed * config.attackSpeed) / (2.0f * config.accelPath);
 
 // Динамічний масив кроків симуляції
 const int MAX_STEPS = 10000;
@@ -517,6 +601,8 @@ int stepCount = 0;
 
 // Основний цикл симуляції
 while (stepCount < MAX_STEPS) {
+    Coord dronePos = physics.getTelemetry().pos;
+
     float bestTime = -1.0f;
     int bestTarget = -1;
 
@@ -554,41 +640,26 @@ while (stepCount < MAX_STEPS) {
     Coord firePoint = calcFirePoint(dronePos, predicted, h, config.accelPath);
 
     float newDir = atan2f(firePoint.y - dronePos.y, firePoint.x - dronePos.x);
-    float deltaAngle = newDir - droneDir;
-    while (deltaAngle >  3.14159f) deltaAngle -= 2*3.14159f;
-    while (deltaAngle < -3.14159f) deltaAngle += 2*3.14159f;
+    
 
 // Заповнюємо крок симуляції
     steps[stepCount].pos             = dronePos;
-    steps[stepCount].direction       = droneDir;
-    steps[stepCount].stateName = droneState->name();
+    steps[stepCount].direction       = physics.getDirection();
+    steps[stepCount].stateName       = physics.getStateName();
     steps[stepCount].targetIdx       = currentTarget;
     steps[stepCount].dropPoint       = firePoint;
-    steps[stepCount].aimPoint        = dronePos + Coord{cosf(droneDir), sinf(droneDir)} * h;
+    steps[stepCount].aimPoint = dronePos + Coord{cosf(physics.getDirection()), sinf(physics.getDirection())} * h;
     steps[stepCount].predictedTarget = predicted;
 
     DroneContext ctx;
-    ctx.dronePos       = dronePos;
-    ctx.droneDir       = droneDir;
-    ctx.droneSpeed     = droneSpeed;
-    ctx.newDir         = newDir;
-    ctx.deltaAngle     = deltaAngle;
-    ctx.attackSpeed    = config.attackSpeed;
-    ctx.accel          = accel;
-    ctx.angularSpeed   = config.angularSpeed;
-    ctx.turnThreshold  = config.turnThreshold;
-    ctx.simTimeStep    = config.simTimeStep;
-
-    auto next = droneState->execute(ctx);
-    if (next) droneState = std::move(next);
-
-    dronePos   = ctx.dronePos;
-    droneDir   = ctx.droneDir;
-    droneSpeed = ctx.droneSpeed;
+    physics.setCommand({newDir});
+    physics.step(config.simTimeStep);
     
 
-    float distToFire = length(firePoint - dronePos);
-    if (distToFire <= config.hitRadius && droneState->name() == std::string("Moving")) break;
+    Coord dronePosAfter = physics.getTelemetry().pos;
+    float distToFire = length(firePoint - dronePosAfter);
+    if (distToFire <= config.hitRadius && std::string(physics.getStateName()) == "Moving") break;
+    
     stepCount++;
     currentTime += config.simTimeStep;
 }
