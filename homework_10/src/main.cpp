@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <mutex>
+#include <queue>
 using json = nlohmann::json;
 
 
@@ -436,6 +437,31 @@ struct DroneTelemetry {
     float timeSecSinceStart;
 };
 
+template<typename T>
+class ThreadSafeQueue {
+private:
+    mutable std::mutex mtx_;
+    std::queue<T> queue_;
+
+public:
+    void push(const T& item) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        queue_.push(item);
+    }
+
+    bool tryPop(T& out) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (queue_.empty()) return false;
+        out = queue_.front();
+        queue_.pop();
+        return true;
+    }
+
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return queue_.empty();
+    }
+};
 class DronePhysics {
 private:
     mutable std::mutex mtx_;
@@ -468,11 +494,14 @@ public:
 
     
     void setCommand(const DroneCommand& cmd) {
+        std::lock_guard<std::mutex> lock(mtx_);
         desiredDir_ = cmd.desiredDir;
+
     }
 
     // Один крок фізики: dt секунд часу
     void step(float dt) {
+        std::lock_guard<std::mutex> lock(mtx_);
         float deltaAngle = desiredDir_ - droneDir_;
         while (deltaAngle >  3.14159f) deltaAngle -= 2*3.14159f;
         while (deltaAngle < -3.14159f) deltaAngle += 2*3.14159f;
