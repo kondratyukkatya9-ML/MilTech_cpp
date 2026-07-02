@@ -676,12 +676,120 @@ public:
     }
 };
 
+class MissionProcessor {
+private:
+    DronePhysics& physics_;
+    ThreadSafeTargetProvider& provider_;
+    BallisticTable& table_;
+    AmmoParams* ammo_;
+    int bombIdx_;
+    DroneConfig config_;
 
+    static const int MAX_STEPS = 10000;
+    std::unique_ptr<SimStep[]> steps_;
+    int stepCount_ = 0;
+
+    std::atomic<bool> threadReady_{false};
+    std::atomic<bool> shouldRun_{false};
+    std::atomic<bool> stopFlag_{false};
+
+public:
+    MissionProcessor(DronePhysics& physics, ThreadSafeTargetProvider& provider,
+                      BallisticTable& table, AmmoParams* ammo, int bombIdx,
+                      const DroneConfig& config)
+        : physics_(physics)
+        , provider_(provider)
+        , table_(table)
+        , ammo_(ammo)
+        , bombIdx_(bombIdx)
+        , config_(config)
+        , steps_(new SimStep[MAX_STEPS])
+    {}
+
+    void run() {
+        threadReady_ = true;
+
+        while (!shouldRun_ && !stopFlag_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        float currentTime = 0.0f;
+        int currentTarget = -1;
+
+        while (stepCount_ < MAX_STEPS && !stopFlag_) {
+            Coord dronePos = physics_.getTelemetry().pos;
+
+            float bestTime = -1.0f;
+            int bestTarget = -1;
+
+            for (int i = 0; i < provider_.getTargetCount(); i++) {
+                Target tgt = provider_.getTarget(i);
+                Coord tPos = tgt.pos;
+                Coord tVel = tgt.velocity;
+                auto res = table_.lookup(config_.altitude, config_.attackSpeed,
+                                          ammo_[bombIdx_].mass, ammo_[bombIdx_].drag, ammo_[bombIdx_].lift);
+                float ft = res.t;
+                float h = res.hDist;
+                Coord predicted = tPos + tVel * ft;
+
+                Coord firePoint = calcFirePoint(dronePos, predicted, h, config_.accelPath);
+                float dist = length(firePoint - dronePos);
+                float totalTime = ft + dist / config_.attackSpeed;
+
+                if (bestTime < 0 || totalTime < bestTime) {
+                    bestTime = totalTime;
+                    bestTarget = i;
+                }
+            }
+            currentTarget = bestTarget;
+
+            Target tgt2 = provider_.getTarget(currentTarget);
+            Coord tPos = tgt2.pos;
+            Coord tVel = tgt2.velocity;
+            auto res = table_.lookup(config_.altitude, config_.attackSpeed,
+                                      ammo_[bombIdx_].mass, ammo_[bombIdx_].drag, ammo_[bombIdx_].lift);
+            float ft = res.t;
+            float h = res.hDist;
+            Coord predicted = tPos + tVel * ft;
+            Coord firePoint = calcFirePoint(dronePos, predicted, h, config_.accelPath);
+
+            float newDir = atan2f(firePoint.y - dronePos.y, firePoint.x - dronePos.x);
+
+            steps_[stepCount_].pos             = dronePos;
+            steps_[stepCount_].direction       = physics_.getDirection();
+            steps_[stepCount_].stateName       = physics_.getStateName();
+            steps_[stepCount_].targetIdx       = currentTarget;
+            steps_[stepCount_].dropPoint       = firePoint;
+            steps_[stepCount_].aimPoint        = dronePos + Coord{cosf(physics_.getDirection()), sinf(physics_.getDirection())} * h;
+            steps_[stepCount_].predictedTarget = predicted;
+
+            physics_.setCommand({newDir});
+
+            Coord dronePosAfter = physics_.getTelemetry().pos;
+            float distToFire = length(firePoint - dronePosAfter);
+            if (distToFire <= config_.hitRadius && std::string(physics_.getStateName()) == "Moving") {
+                stopFlag_ = true;
+                break;
+            }
+
+            stepCount_++;
+            currentTime += config_.simTimeStep;
+
+            std::this_thread::sleep_for(std::chrono::duration<float>(config_.simTimeStep));
+        }
+    }
+
+    bool isThreadReady() const { return threadReady_; }
+    void start() { shouldRun_ = true; }
+    void stop() { stopFlag_ = true; }
+
+    int getStepCount() const { return stepCount_; }
+    const SimStep* getSteps() const { return steps_.get(); }
+};
         
 
    
 int main() {
-    // Читаємо config.json
     std::ifstream fc("config.json");
     if (!fc.is_open()) {
         std::cerr << "Cannot open config.json" << std::endl;
@@ -689,8 +797,6 @@ int main() {
     }
     json jc;
     fc >> jc;
-
-
 
     DroneConfig config;
     config.startPos.x   = jc["drone"]["position"]["x"];
@@ -708,13 +814,13 @@ int main() {
 
     LOG("Config loaded: speed=" << config.attackSpeed);
 
-    std::ifstream fa("ammo.json"); 
-    json ja;                        
-    fa >> ja;                       
+    std::ifstream fa("ammo.json");
+    json ja;
+    fa >> ja;
 
-    int ammoCount = ja.size();      
+    int ammoCount = ja.size();
 
-    std::unique_ptr<AmmoParams[]> ammo(new AmmoParams[ammoCount]);  
+    std::unique_ptr<AmmoParams[]> ammo(new AmmoParams[ammoCount]);
     for (int i = 0; i < ammoCount; ++i) {
         ammo[i].mass = ja[i]["mass"];
         ammo[i].drag = ja[i]["drag"];
@@ -724,128 +830,73 @@ int main() {
     LOG("Ammo loaded: " << ammoCount << " types");
 
     BallisticTable table;
-if (!table.load("ballistic_table.txt")) {
-    std::cerr << "Cannot open ballistic_table.txt" << std::endl;
-    return 1;
-}
-LOG("Ballistic table loaded");
+    if (!table.load("ballistic_table.txt")) {
+        std::cerr << "Cannot open ballistic_table.txt" << std::endl;
+        return 1;
+    }
+    LOG("Ballistic table loaded");
 
     ThreadSafeTargetProvider provider("targets.json");
     provider.setArrayTimeStep(config.arrayTimeStep);
-    LOG("Targets loaded: " << provider.getTargetCount());  
+    LOG("Targets loaded: " << provider.getTargetCount());
 
-// Знаходимо боєприпас
-int bombIdx = -1;
-for (int i = 0; i < ammoCount; i++) {
-    if (strcmp(ammo[i].name, config.ammoName) == 0) {
-        bombIdx = i;
-        break;
-    }
-}
-if (bombIdx == -1) {
-    std::cerr << "Unknown ammo: " << config.ammoName << std::endl;
-    
-    return 1;
-}
-LOG("Ammo found: " << ammo[bombIdx].name);
-
-// Ініціалізація дрона
-float accel = (config.attackSpeed * config.attackSpeed) / (2.0f * config.accelPath);
-
-DronePhysics physics(config.startPos, config.initialDir, accel,
-                      config.angularSpeed, config.turnThreshold, config.attackSpeed);
-
-float currentTime = 0.0f;
-int currentTarget = -1;
-
-// Динамічний масив кроків симуляції
-const int MAX_STEPS = 10000;
-std::unique_ptr<SimStep[]> steps(new SimStep[MAX_STEPS]);
-int stepCount = 0;
-
-// Основний цикл симуляції
-while (stepCount < MAX_STEPS) {
-    Coord dronePos = physics.getTelemetry().pos;
-    provider.step(currentTime);  
-
-
-    float bestTime = -1.0f;
-    int bestTarget = -1;
-
-   for (int i = 0; i < provider.getTargetCount(); i++) {
-    Target tgt = provider.getTarget(i);
-    Coord tPos = tgt.pos;
-    Coord tVel = tgt.velocity;
-        auto res = table.lookup(config.altitude, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
-        float ft = res.t;
-        float h = res.hDist;
-        Coord predicted = tPos + tVel * ft;
-
-        Coord firePoint = calcFirePoint(dronePos, predicted, h, config.accelPath);
-        float dist = length(firePoint - dronePos);
-        float timeToStop = 0.0f; 
-        float totalTime = ft + dist / config.attackSpeed + timeToStop;
-
-        if (bestTime < 0 || totalTime < bestTime) {
-            bestTime = totalTime;
-            bestTarget = i;
+    int bombIdx = -1;
+    for (int i = 0; i < ammoCount; i++) {
+        if (strcmp(ammo[i].name, config.ammoName) == 0) {
+            bombIdx = i;
+            break;
         }
     }
-    currentTarget = bestTarget;
+    if (bombIdx == -1) {
+        std::cerr << "Unknown ammo: " << config.ammoName << std::endl;
+        return 1;
+    }
+    LOG("Ammo found: " << ammo[bombIdx].name);
 
-   Target tgt2 = provider.getTarget(currentTarget);
-    Coord tPos = tgt2.pos;
-    Coord tVel = tgt2.velocity;
-    auto res = table.lookup(config.altitude, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
-    float ft = res.t;
-    float h = res.hDist;
-    Coord predicted = tPos + tVel * ft;
-    Coord firePoint = calcFirePoint(dronePos, predicted, h, config.accelPath);
+    float accel = (config.attackSpeed * config.attackSpeed) / (2.0f * config.accelPath);
+    DronePhysics physics(config.startPos, config.initialDir, accel,
+                          config.angularSpeed, config.turnThreshold, config.attackSpeed);
 
-    float newDir = atan2f(firePoint.y - dronePos.y, firePoint.x - dronePos.x);
-    
+    MissionProcessor mission(physics, provider, table, ammo.get(), bombIdx, config);
 
-// Заповнюємо крок симуляції
-    steps[stepCount].pos             = dronePos;
-    steps[stepCount].direction       = physics.getDirection();
-    steps[stepCount].stateName       = physics.getStateName();
-    steps[stepCount].targetIdx       = currentTarget;
-    steps[stepCount].dropPoint       = firePoint;
-    steps[stepCount].aimPoint = dronePos + Coord{cosf(physics.getDirection()), sinf(physics.getDirection())} * h;
-    steps[stepCount].predictedTarget = predicted;
+    std::thread providerThread(&ThreadSafeTargetProvider::run, &provider);
+    std::thread physicsThread(&DronePhysics::run, &physics);
+    std::thread missionThread(&MissionProcessor::run, &mission);
 
-    physics.setCommand({newDir});
-    physics.step(config.simTimeStep);
-    
+    while (!provider.isThreadReady() || !physics.isThreadReady() || !mission.isThreadReady())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
-    Coord dronePosAfter = physics.getTelemetry().pos;
-    float distToFire = length(firePoint - dronePosAfter);
-    if (distToFire <= config.hitRadius && std::string(physics.getStateName()) == "Moving") break;
-    
-    stepCount++;
-    currentTime += config.simTimeStep;
-}
-LOG("Simulation complete. Steps: " << stepCount);
+    provider.start();
+    physics.start();
+    mission.start();
 
-// Запис у simulation.json
-json out;
-out["totalSteps"] = stepCount;
-out["steps"] = json::array();
-for (int i = 0; i < stepCount; i++) {
-    json step;
-    step["position"]        = {{"x", steps[i].pos.x}, {"y", steps[i].pos.y}};
-    step["direction"]       = steps[i].direction;
-    step["state"] = steps[i].stateName;
-    step["targetIndex"]     = steps[i].targetIdx;
-    step["dropPoint"]       = {{"x", steps[i].dropPoint.x}, {"y", steps[i].dropPoint.y}};
-    step["aimPoint"]        = {{"x", steps[i].aimPoint.x}, {"y", steps[i].aimPoint.y}};
-    step["predictedTarget"] = {{"x", steps[i].predictedTarget.x}, {"y", steps[i].predictedTarget.y}};
-    out["steps"].push_back(step);
-}
-std::ofstream fout("simulation.json");
-fout << out.dump(2);
-fout.close();
-LOG("simulation.json written");
+    missionThread.join();
+    physics.stop();
+    provider.stop();
+    providerThread.join();
+    physicsThread.join();
+
+    LOG("Simulation complete. Steps: " << mission.getStepCount());
+
+    json out;
+    out["totalSteps"] = mission.getStepCount();
+    out["steps"] = json::array();
+    const SimStep* steps = mission.getSteps();
+    for (int i = 0; i < mission.getStepCount(); i++) {
+        json step;
+        step["position"]        = {{"x", steps[i].pos.x}, {"y", steps[i].pos.y}};
+        step["direction"]       = steps[i].direction;
+        step["state"]           = steps[i].stateName;
+        step["targetIndex"]     = steps[i].targetIdx;
+        step["dropPoint"]       = {{"x", steps[i].dropPoint.x}, {"y", steps[i].dropPoint.y}};
+        step["aimPoint"]        = {{"x", steps[i].aimPoint.x}, {"y", steps[i].aimPoint.y}};
+        step["predictedTarget"] = {{"x", steps[i].predictedTarget.x}, {"y", steps[i].predictedTarget.y}};
+        out["steps"].push_back(step);
+    }
+    std::ofstream fout("simulation.json");
+    fout << out.dump(2);
+    fout.close();
+    LOG("simulation.json written");
 
     return 0;
 }
