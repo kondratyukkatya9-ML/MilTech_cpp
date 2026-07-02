@@ -480,6 +480,15 @@ private:
     float turnThreshold_;
     float attackSpeed_;
 
+    float physicsTimeStep_ = 0.01f;
+    float timeScale_ = 1.0f;
+
+    std::atomic<bool> threadReady_{false};
+    std::atomic<bool> shouldRun_{false};
+    std::atomic<bool> stopFlag_{false};
+
+    ThreadSafeQueue<DroneCommand> commandQueue_;
+
 public:
     DronePhysics(Coord startPos, float initialDir, float accel,
                  float angularSpeed, float turnThreshold, float attackSpeed)
@@ -492,19 +501,24 @@ public:
         , angularSpeed_(angularSpeed)
         , turnThreshold_(turnThreshold)
         , attackSpeed_(attackSpeed)
-
     {}
 
-    
-    void setCommand(const DroneCommand& cmd) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        desiredDir_ = cmd.desiredDir;
+    void setPhysicsTimeStep(float step) { physicsTimeStep_ = step; }
+    void setTimeScale(float scale) { timeScale_ = scale; }
 
+    void setCommand(const DroneCommand& cmd) {
+        commandQueue_.push(cmd);
     }
 
-    // Один крок фізики: dt секунд часу
-    void step(float dt) {
+   void step(float dt) {
+        DroneCommand cmd;
+        while (commandQueue_.tryPop(cmd)) {
+            std::lock_guard<std::mutex> lock(mtx_);
+            desiredDir_ = cmd.desiredDir;
+        }
+
         std::lock_guard<std::mutex> lock(mtx_);
+
         float deltaAngle = desiredDir_ - droneDir_;
         while (deltaAngle >  3.14159f) deltaAngle -= 2*3.14159f;
         while (deltaAngle < -3.14159f) deltaAngle += 2*3.14159f;
@@ -515,7 +529,7 @@ public:
         ctx.droneSpeed    = droneSpeed_;
         ctx.newDir        = desiredDir_;
         ctx.deltaAngle    = deltaAngle;
-        ctx.attackSpeed   = attackSpeed_;   
+        ctx.attackSpeed   = attackSpeed_;
         ctx.accel         = accel_;
         ctx.angularSpeed  = angularSpeed_;
         ctx.turnThreshold = turnThreshold_;
@@ -527,25 +541,44 @@ public:
         dronePos_   = ctx.dronePos;
         droneDir_   = ctx.droneDir;
         droneSpeed_ = ctx.droneSpeed;
+    } 
+  
+    void run() {
+    threadReady_ = true;
+
+    while (!shouldRun_ && !stopFlag_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    // Поточна телеметрія — позиція, швидкість, час оновлення
+    while (!stopFlag_) {
+        step(physicsTimeStep_);
+
+        std::this_thread::sleep_for(
+            std::chrono::duration<float>(physicsTimeStep_ / timeScale_));
+    }
+}
+    bool isThreadReady() const { return threadReady_; }
+    void start() { shouldRun_ = true; }
+    void stop() { stopFlag_ = true; }
+
     DroneTelemetry getTelemetry() const {
         std::lock_guard<std::mutex> lock(mtx_);
         DroneTelemetry t;
         t.pos = dronePos_;
         t.speed = Coord{ droneSpeed_ * cosf(droneDir_), droneSpeed_ * sinf(droneDir_) };
-        t.timeSecSinceStart = 0.0f;  
+        t.timeSecSinceStart = 0.0f;
         return t;
     }
 
-    // Поточний напрямок і назва стану 
-    float getDirection() const { 
+    float getDirection() const {
         std::lock_guard<std::mutex> lock(mtx_);
-        return droneDir_; }
-    const char* getStateName() const { 
+        return droneDir_;
+    }
+
+    const char* getStateName() const {
         std::lock_guard<std::mutex> lock(mtx_);
-        return droneState_->name(); }
+        return droneState_->name();
+    }
 };
 
 //ThreadSafeTargetProvider
