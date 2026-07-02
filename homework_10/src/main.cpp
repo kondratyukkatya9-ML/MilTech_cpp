@@ -7,6 +7,9 @@
 #include <string>
 #include <mutex>
 #include <queue>
+#include <thread>
+#include <atomic>
+#include <chrono>
 using json = nlohmann::json;
 
 
@@ -546,7 +549,6 @@ public:
 };
 
 //ThreadSafeTargetProvider
-
 class ThreadSafeTargetProvider {
 private:
     std::unique_ptr<Coord*[]> trajectories_;
@@ -556,6 +558,13 @@ private:
 
     mutable std::mutex mtx_;
     std::unique_ptr<Target[]> currentTargets_;
+
+    float targetTimeStep_ = 0.05f;
+    float timeScale_ = 1.0f;
+
+    std::atomic<bool> threadReady_{false};
+    std::atomic<bool> shouldRun_{false};
+    std::atomic<bool> stopFlag_{false};
 
 public:
     ThreadSafeTargetProvider(const char* path) {
@@ -589,6 +598,8 @@ public:
     }
 
     void setArrayTimeStep(float step) { arrayTimeStep_ = step; }
+    void setTargetTimeStep(float step) { targetTimeStep_ = step; }
+    void setTimeScale(float scale) { timeScale_ = scale; }
 
     void step(float currentTime) {
         float dt = arrayTimeStep_;
@@ -603,6 +614,27 @@ public:
         }
     }
 
+    void run() {
+        threadReady_ = true;
+
+        while (!shouldRun_ && !stopFlag_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        float currentTime = 0.0f;
+        while (!stopFlag_) {
+            step(currentTime);
+            currentTime += targetTimeStep_;
+
+            std::this_thread::sleep_for(
+                std::chrono::duration<float>(targetTimeStep_ / timeScale_));
+        }
+    }
+
+    bool isThreadReady() const { return threadReady_; }
+    void start() { shouldRun_ = true; }
+    void stop() { stopFlag_ = true; }
+
     int getTargetCount() const { return targetCount_; }
 
     Target getTarget(int idx) const {
@@ -610,6 +642,8 @@ public:
         return currentTargets_[idx];
     }
 };
+
+
         
 
    
