@@ -98,6 +98,11 @@ struct SimStep {
     Coord aimPoint;
     Coord predictedTarget;
 };
+struct Target {
+    Coord pos;      // поточна позиція цілі
+    Coord velocity; // поточна швидкість цілі
+};
+
 enum DroneState {
     STOPPED,
     ACCELERATING,
@@ -418,7 +423,7 @@ void updateDrone(Coord& dronePos, float& droneDir,
         }
     }
 }
-// ==================== ДЗ10: DronePhysics ====================
+//  DronePhysics 
 
 struct DroneCommand {
     float desiredDir;  // бажаний напрямок польоту
@@ -503,6 +508,67 @@ public:
     const char* getStateName() const { return droneState_->name(); }
 };
 
+//ThreadSafeTargetProvider
+
+class ThreadSafeTargetProvider {
+private:
+    std::unique_ptr<Coord*[]> trajectories_;  
+    int targetCount_;
+    int timeSteps_;
+    float arrayTimeStep_;
+
+    std::unique_ptr<Target[]> currentTargets_;  // поточний знімок кожної цілі
+
+public:
+    ThreadSafeTargetProvider(const char* path) {
+        std::ifstream ft(path);
+        if (!ft.is_open()) {
+            std::cerr << "Cannot open " << path << std::endl;
+            std::exit(1);
+        }
+        json jt;
+        ft >> jt;
+
+        targetCount_   = jt["targetCount"];
+        timeSteps_     = jt["timeSteps"];
+        arrayTimeStep_ = 1.0f;  
+
+        trajectories_.reset(new Coord*[targetCount_]);
+        for (int i = 0; i < targetCount_; i++) {
+            trajectories_[i] = new Coord[timeSteps_];
+            for (int j = 0; j < timeSteps_; j++) {
+                trajectories_[i][j].x = jt["targets"][i]["positions"][j]["x"];
+                trajectories_[i][j].y = jt["targets"][i]["positions"][j]["y"];
+            }
+        }
+
+        currentTargets_.reset(new Target[targetCount_]);
+    }
+
+    ~ThreadSafeTargetProvider() {
+        for (int i = 0; i < targetCount_; i++)
+            delete[] trajectories_[i];
+    }
+
+    void setArrayTimeStep(float step) { arrayTimeStep_ = step; }
+
+    // Один крок: оновлення позиція+швидкість кожної цілі на момент currentTime
+    void step(float currentTime) {
+        float dt = arrayTimeStep_;
+        for (int i = 0; i < targetCount_; i++) {
+            Coord pos  = interpolateTarget(trajectories_.get(), i, currentTime,      arrayTimeStep_, timeSteps_);
+            Coord next = interpolateTarget(trajectories_.get(), i, currentTime + dt, arrayTimeStep_, timeSteps_);
+            Coord vel  = (next - pos) * (1.0f / dt);
+
+            currentTargets_[i].pos      = pos;
+            currentTargets_[i].velocity = vel;
+        }
+    }
+
+    int getTargetCount() const { return targetCount_; }
+
+    Target getTarget(int idx) const { return currentTargets_[idx]; }
+};
 int main() {
     // Читаємо config.json
     std::ifstream fc("config.json");
@@ -553,22 +619,9 @@ if (!table.load("ballistic_table.txt")) {
 }
 LOG("Ballistic table loaded");
 
-    std::ifstream ft("targets.json");
-    json jt;
-    ft >> jt;
-
-    int tgtCount  = jt["targetCount"];
-    int timeSteps = jt["timeSteps"];
-
-    std::unique_ptr<Coord*[]> targets(new Coord*[tgtCount]);
-for (int i = 0; i < tgtCount; i++) { 
-    targets[i] = new Coord[timeSteps];
-    for (int j = 0; j < timeSteps; j++) {
-        targets[i][j].x = jt["targets"][i]["positions"][j]["x"];
-        targets[i][j].y = jt["targets"][i]["positions"][j]["y"];
-    }
-}
-LOG("Targets loaded: " << tgtCount);
+    ThreadSafeTargetProvider provider("targets.json");
+    provider.setArrayTimeStep(config.arrayTimeStep);
+    LOG("Targets loaded: " << provider.getTargetCount());  
 
 // Знаходимо боєприпас
 int bombIdx = -1;
@@ -602,17 +655,16 @@ int stepCount = 0;
 // Основний цикл симуляції
 while (stepCount < MAX_STEPS) {
     Coord dronePos = physics.getTelemetry().pos;
+    provider.step(currentTime);  
+
 
     float bestTime = -1.0f;
     int bestTarget = -1;
 
-    for (int i = 0; i < tgtCount; i++) {
-        Coord tPos = interpolateTarget(targets.get(), i, currentTime, config.arrayTimeStep, timeSteps);
-        
-
-        float dt = config.simTimeStep;
-        Coord tNext = interpolateTarget(targets.get(), i, currentTime + dt, config.arrayTimeStep, timeSteps);
-        Coord tVel = (tNext - tPos) * (1.0f / dt);
+   for (int i = 0; i < provider.getTargetCount(); i++) {
+    Target tgt = provider.getTarget(i);
+    Coord tPos = tgt.pos;
+    Coord tVel = tgt.velocity;
         auto res = table.lookup(config.altitude, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
         float ft = res.t;
         float h = res.hDist;
@@ -630,12 +682,12 @@ while (stepCount < MAX_STEPS) {
     }
     currentTarget = bestTarget;
 
-    Coord tPos = interpolateTarget(targets.get(), currentTarget, currentTime, config.arrayTimeStep, timeSteps);
-    Coord tNext = interpolateTarget(targets.get(), currentTarget, currentTime + config.simTimeStep, config.arrayTimeStep, timeSteps);
+   Target tgt2 = provider.getTarget(currentTarget);
+    Coord tPos = tgt2.pos;
+    Coord tVel = tgt2.velocity;
     auto res = table.lookup(config.altitude, config.attackSpeed, ammo[bombIdx].mass, ammo[bombIdx].drag, ammo[bombIdx].lift);
     float ft = res.t;
     float h = res.hDist;
-    Coord tVel = (tNext - tPos) * (1.0f / config.simTimeStep);
     Coord predicted = tPos + tVel * ft;
     Coord firePoint = calcFirePoint(dronePos, predicted, h, config.accelPath);
 
@@ -651,7 +703,6 @@ while (stepCount < MAX_STEPS) {
     steps[stepCount].aimPoint = dronePos + Coord{cosf(physics.getDirection()), sinf(physics.getDirection())} * h;
     steps[stepCount].predictedTarget = predicted;
 
-    DroneContext ctx;
     physics.setCommand({newDir});
     physics.step(config.simTimeStep);
     
@@ -684,12 +735,6 @@ std::ofstream fout("simulation.json");
 fout << out.dump(2);
 fout.close();
 LOG("simulation.json written");
-
-// Звільнення пам'яті
-
-
-for (int i = 0; i < tgtCount; i++)
-    delete[] targets[i];
 
     return 0;
 }
