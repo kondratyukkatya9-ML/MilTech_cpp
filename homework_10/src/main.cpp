@@ -834,10 +834,15 @@ int main() {
         std::cerr << "Cannot open ballistic_table.txt" << std::endl;
         return 1;
     }
+    float targetTimeStep  = jc["simulation"].value("targetTimeStep",  0.05f);
+    float physicsTimeStep = jc["simulation"].value("physicsTimeStep", 0.01f);
+    float timeScale       = jc["simulation"].value("timeScale",       1.0f);
     LOG("Ballistic table loaded");
 
     ThreadSafeTargetProvider provider("targets.json");
     provider.setArrayTimeStep(config.arrayTimeStep);
+    provider.setTargetTimeStep(targetTimeStep);
+    provider.setTimeScale(timeScale);
     LOG("Targets loaded: " << provider.getTargetCount());
 
     int bombIdx = -1;
@@ -856,7 +861,8 @@ int main() {
     float accel = (config.attackSpeed * config.attackSpeed) / (2.0f * config.accelPath);
     DronePhysics physics(config.startPos, config.initialDir, accel,
                           config.angularSpeed, config.turnThreshold, config.attackSpeed);
-
+    physics.setPhysicsTimeStep(physicsTimeStep);
+    physics.setTimeScale(timeScale);
     MissionProcessor mission(physics, provider, table, ammo.get(), bombIdx, config);
 
     std::thread providerThread(&ThreadSafeTargetProvider::run, &provider);
