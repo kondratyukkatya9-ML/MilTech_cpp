@@ -374,10 +374,8 @@ Coord calcFirePoint(Coord dronePos, Coord targetPos,
     Coord dir = normalize(delta);
 
     if (h + accelPath > D) {
-        Coord startPos = targetPos - dir * (h + accelPath);
-        Coord delta2 = startPos - dronePos;
-        float D2 = length(delta2);
-        return dronePos + normalize(delta2) * (D2 - h);
+        
+        return targetPos - dir * h;
     }
     return dronePos + dir * (D - h);
 }
@@ -482,8 +480,8 @@ private:
     float turnThreshold_;
     float attackSpeed_;
 
-    float physicsTimeStep_ = 0.01f;
-    float timeScale_ = 1.0f;
+    float physicsTimeStep_ = 0.01f; 
+    float timeScale_ = 1.0f; // 1.0 це дефолтне значення, реальне зчитується з config.json  і зараз дорівнює 10.0
     float elapsedTime_ = 0.0f;
 
     std::atomic<bool> threadReady_{false};
@@ -725,8 +723,8 @@ public:
         int currentTarget = -1;
 
         while (stepCount_ < MAX_STEPS && !stopFlag_) {
-            Coord dronePos = physics_.getTelemetry().pos;
-
+            DroneTelemetry telemetry = physics_.getTelemetry();
+            Coord dronePos = telemetry.pos;
             float bestTime = -1.0f;
             int bestTarget = -1;
 
@@ -770,8 +768,7 @@ public:
             steps_[stepCount_].dropPoint       = firePoint;
             steps_[stepCount_].aimPoint        = dronePos + Coord{cosf(physics_.getDirection()), sinf(physics_.getDirection())} * h;
             steps_[stepCount_].predictedTarget = predicted;
-            steps_[stepCount_].timeSecSinceStart = physics_.getTelemetry().timeSecSinceStart;
-
+            steps_[stepCount_].timeSecSinceStart = telemetry.timeSecSinceStart;
 
             physics_.setCommand({newDir});
 
