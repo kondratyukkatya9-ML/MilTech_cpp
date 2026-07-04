@@ -102,6 +102,8 @@ struct SimStep {
     Coord dropPoint;
     Coord aimPoint;
     Coord predictedTarget;
+    float timeSecSinceStart;
+
 };
 struct Target {
     Coord pos;      // поточна позиція цілі
@@ -482,6 +484,7 @@ private:
 
     float physicsTimeStep_ = 0.01f;
     float timeScale_ = 1.0f;
+    float elapsedTime_ = 0.0f;
 
     std::atomic<bool> threadReady_{false};
     std::atomic<bool> shouldRun_{false};
@@ -541,7 +544,12 @@ public:
         dronePos_   = ctx.dronePos;
         droneDir_   = ctx.droneDir;
         droneSpeed_ = ctx.droneSpeed;
-    } 
+        dronePos_   = ctx.dronePos;
+        droneDir_   = ctx.droneDir;
+        droneSpeed_ = ctx.droneSpeed;
+        elapsedTime_ += dt;
+    }
+    
   
     void run() {
     threadReady_ = true;
@@ -566,7 +574,7 @@ public:
         DroneTelemetry t;
         t.pos = dronePos_;
         t.speed = Coord{ droneSpeed_ * cosf(droneDir_), droneSpeed_ * sinf(droneDir_) };
-        t.timeSecSinceStart = 0.0f;
+        t.timeSecSinceStart = elapsedTime_;
         return t;
     }
 
@@ -762,6 +770,8 @@ public:
             steps_[stepCount_].dropPoint       = firePoint;
             steps_[stepCount_].aimPoint        = dronePos + Coord{cosf(physics_.getDirection()), sinf(physics_.getDirection())} * h;
             steps_[stepCount_].predictedTarget = predicted;
+            steps_[stepCount_].timeSecSinceStart = physics_.getTelemetry().timeSecSinceStart;
+
 
             physics_.setCommand({newDir});
 
@@ -897,6 +907,8 @@ int main() {
         step["dropPoint"]       = {{"x", steps[i].dropPoint.x}, {"y", steps[i].dropPoint.y}};
         step["aimPoint"]        = {{"x", steps[i].aimPoint.x}, {"y", steps[i].aimPoint.y}};
         step["predictedTarget"] = {{"x", steps[i].predictedTarget.x}, {"y", steps[i].predictedTarget.y}};
+        step["timeSecSinceStart"] = steps[i].timeSecSinceStart;
+
         out["steps"].push_back(step);
     }
     std::ofstream fout("simulation.json");
