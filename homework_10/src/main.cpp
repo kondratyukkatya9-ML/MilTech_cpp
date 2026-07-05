@@ -108,6 +108,8 @@ struct SimStep {
 struct Target {
     Coord pos;      // поточна позиція цілі
     Coord velocity; // поточна швидкість цілі
+    Coord accel;    // поточне прискорення цілі (кінцева різниця швидкості)
+
 };
 
 enum DroneState {
@@ -597,7 +599,8 @@ private:
 
     mutable std::mutex mtx_;
     std::unique_ptr<Target[]> currentTargets_;
-
+    std::unique_ptr<Coord[]> prevVelocities_;
+    bool hasPrevVelocity_ = false;
     float targetTimeStep_ = 0.05f;
     float timeScale_ = 1.0f;
 
@@ -629,6 +632,7 @@ public:
         }
 
         currentTargets_.reset(new Target[targetCount_]);
+        prevVelocities_.reset(new Coord[targetCount_]);
     }
 
     ~ThreadSafeTargetProvider() {
@@ -640,17 +644,25 @@ public:
     void setTargetTimeStep(float step) { targetTimeStep_ = step; }
     void setTimeScale(float scale) { timeScale_ = scale; }
 
-    void step(float currentTime) {
+   void step(float currentTime) {
         float dt = arrayTimeStep_;
         for (int i = 0; i < targetCount_; i++) {
             Coord pos  = interpolateTarget(trajectories_.get(), i, currentTime,      arrayTimeStep_, timeSteps_);
             Coord next = interpolateTarget(trajectories_.get(), i, currentTime + dt, arrayTimeStep_, timeSteps_);
             Coord vel  = (next - pos) * (1.0f / dt);
 
+            Coord acc{0.0f, 0.0f};
+            if (hasPrevVelocity_) {
+                acc = (vel - prevVelocities_[i]) * (1.0f / targetTimeStep_);
+            }
+            prevVelocities_[i] = vel;
+
             std::lock_guard<std::mutex> lock(mtx_);
             currentTargets_[i].pos      = pos;
             currentTargets_[i].velocity = vel;
+            currentTargets_[i].accel    = acc;
         }
+        hasPrevVelocity_ = true;
     }
 
     void run() {
@@ -738,8 +750,7 @@ public:
                                           ammo_[bombIdx_].mass, ammo_[bombIdx_].drag, ammo_[bombIdx_].lift);
                 float ft = res.t;
                 float h = res.hDist;
-                Coord predicted = tPos + tVel * ft;
-
+                Coord predicted = tPos + tVel * ft + tgt.accel * (0.5f * ft * ft);
                 Coord firePoint = calcFirePoint(dronePos, predicted, h, config_.accelPath);
                 float dist = length(firePoint - dronePos);
                 float totalTime = ft + dist / config_.attackSpeed;
@@ -758,7 +769,7 @@ public:
                                       ammo_[bombIdx_].mass, ammo_[bombIdx_].drag, ammo_[bombIdx_].lift);
             float ft = res.t;
             float h = res.hDist;
-            Coord predicted = tPos + tVel * ft;
+            Coord predicted = tPos + tVel * ft + tgt2.accel * (0.5f * ft * ft);
             Coord firePoint = calcFirePoint(dronePos, predicted, h, config_.accelPath);
 
             float newDir = atan2f(firePoint.y - dronePos.y, firePoint.x - dronePos.x);
