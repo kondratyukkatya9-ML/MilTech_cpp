@@ -698,6 +698,8 @@ private:
     std::atomic<bool> threadReady_{false};
     std::atomic<bool> shouldRun_{false};
     std::atomic<bool> stopFlag_{false};
+    float timeScale_ = 1.0f;  // дефолт; реальне значення зчитується з config.json ("simulation.timeScale")
+
 
 public:
     MissionProcessor(DronePhysics& physics, ThreadSafeTargetProvider& provider,
@@ -781,14 +783,15 @@ public:
 
             stepCount_++;
             currentTime += config_.simTimeStep;
-
-            std::this_thread::sleep_for(std::chrono::duration<float>(config_.simTimeStep));
+            std::this_thread::sleep_for(std::chrono::duration<float>(config_.simTimeStep / timeScale_));
         }
     }
 
     bool isThreadReady() const { return threadReady_; }
     void start() { shouldRun_ = true; }
     void stop() { stopFlag_ = true; }
+    void setTimeScale(float scale) { timeScale_ = scale; }
+
 
     int getStepCount() const { return stepCount_; }
     const SimStep* getSteps() const { return steps_.get(); }
@@ -871,6 +874,7 @@ int main() {
     physics.setPhysicsTimeStep(physicsTimeStep);
     physics.setTimeScale(timeScale);
     MissionProcessor mission(physics, provider, table, ammo.get(), bombIdx, config);
+    mission.setTimeScale(timeScale);
 
     std::thread providerThread(&ThreadSafeTargetProvider::run, &provider);
     std::thread physicsThread(&DronePhysics::run, &physics);
