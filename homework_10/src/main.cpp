@@ -774,12 +774,25 @@ public:
 
             physics_.setCommand({newDir});
 
+            //Coord dronePosAfter = physics_.getTelemetry().pos;
+            //float distToFire = length(firePoint - dronePosAfter);
+            //if (distToFire <= config_.hitRadius && std::string(physics_.getStateName()) == "Moving") {
+            //    stopFlag_ = true;
+            //    break;
+            //}
             Coord dronePosAfter = physics_.getTelemetry().pos;
             float distToFire = length(firePoint - dronePosAfter);
-            if (distToFire <= config_.hitRadius && std::string(physics_.getStateName()) == "Moving") {
+            float navEpsilon = config_.attackSpeed * config_.simTimeStep;  // відстань за один крок планування, замість hitRadius
+            if (distToFire <= navEpsilon && std::string(physics_.getStateName()) == "Moving") {
+                float finalDir = atan2f(firePoint.y - dronePosAfter.y, firePoint.x - dronePosAfter.x);
+                steps_[stepCount_].pos       = dronePosAfter;
+                steps_[stepCount_].direction = physics_.getDirection();
+                steps_[stepCount_].aimPoint  = dronePosAfter + Coord{cosf(finalDir), sinf(finalDir)} * h;
+
                 stopFlag_ = true;
                 break;
-            }
+        }
+
 
             stepCount_++;
             currentTime += config_.simTimeStep;
