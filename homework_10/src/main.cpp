@@ -1,0 +1,856 @@
+#include <iostream>
+#include <cmath>
+#include "json.hpp" 
+#include <fstream>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <atomic>
+#include <chrono>
+using json = nlohmann::json;
+
+
+#define ENABLE_LOG   0
+#define ENABLE_DEBUG 0
+
+#if ENABLE_LOG
+  #define LOG(msg) std::cout << "[LOG] " << msg << std::endl
+#else
+  #define LOG(msg)
+#endif
+
+#if ENABLE_DEBUG
+  #define DEBUG(msg) std::cout << "[DEBUG] " << msg << std::endl
+#else
+  #define DEBUG(msg)
+#endif
+
+struct Coord {
+    float x;
+    float y;
+
+    //Додавання координат
+    Coord operator+(const Coord& other) const {
+        Coord result;
+        result.x = x + other.x;
+        result.y = y + other.y;
+        return result;
+    }
+    //Віднімання координат
+    Coord operator-(const Coord& other) const {
+        Coord result;
+        result.x = x - other.x;
+        result.y = y - other.y;
+        return result;
+    }
+    //Множення координат на скаляр
+    Coord operator*(float s) const {
+        Coord result;
+        result.x = x * s;
+        result.y = y * s;
+        return result;
+    }
+    //Ділення координат на скаляр
+    Coord operator/(float s ) const {
+        Coord result;
+        result.x = x / s;
+        result.y = y / s;
+        return result;
+    }
+    //Перевірка на рівність координат
+    bool operator==(const Coord& other) const {
+        return (x == other.x && y == other.y);
+    }
+};
+//Обчислення довжини вектора
+ float length(Coord c) {
+    return hypotf(c.x, c.y);
+}
+//Нормалізація вектора
+Coord normalize(Coord c) {
+    return c / length(c);
+}
+
+struct AmmoParams {
+    char name[32];
+    float mass; // маса (кг)
+    float drag; // коефіцієнт опору
+    float lift; // коефіцієнт підйому
+};
+struct DroneConfig {
+    Coord startPos;
+    float altitude;
+    float initialDir;
+    float attackSpeed;
+    float accelPath;
+    char  ammoName[32];
+    float arrayTimeStep;
+    float simTimeStep;
+    float hitRadius;
+    float angularSpeed;
+    float turnThreshold;
+};
+struct SimStep {
+    Coord pos;
+    float direction;
+    
+    std::string stateName;
+    int   targetIdx;
+    Coord dropPoint;
+    Coord aimPoint;
+    Coord predictedTarget;
+    float timeSecSinceStart;
+
+};
+struct Target {
+    Coord pos;      // поточна позиція цілі
+    Coord velocity; // поточна швидкість цілі
+    Coord accel;    // поточне прискорення цілі (кінцева різниця швидкості)
+
+};
+
+
+struct DroneContext {
+    Coord dronePos;
+    float droneDir;
+    float droneSpeed;
+
+
+    float newDir;
+    float deltaAngle;
+
+    float attackSpeed;
+    float accel;
+    float angularSpeed;
+    float turnThreshold;
+    float simTimeStep;
+};
+
+struct BallisticTable {
+    std::vector<float> axisZ0;
+    std::vector<float> axisV0;
+    std::vector<float> axisM;
+    std::vector<float> axisD;
+    std::vector<float> axisL;
+
+    struct Result {
+        float t;
+        float hDist;
+    };
+
+    std::vector<Result> data;
+
+    size_t index(int iz, int iv, int im, int id, int il) const {
+        return ((((size_t)iz * axisV0.size() + iv)
+                              * axisM.size()  + im)
+                              * axisD.size()  + id)
+                              * axisL.size()  + il;
+    }
+
+    const Result& at(int iz, int iv, int im, int id, int il) const {
+        return data[index(iz, iv, im, id, il)];
+    }
+
+    bool load(const char* path) {
+        std::ifstream f(path);
+        if (!f.is_open()) return false;
+
+        int nZ, nV, nM, nD, nL;
+        f >> nZ >> nV >> nM >> nD >> nL;
+
+        axisZ0.resize(nZ); for (auto& v : axisZ0) f >> v;
+        axisV0.resize(nV); for (auto& v : axisV0) f >> v;
+        axisM.resize(nM);  for (auto& v : axisM)  f >> v;
+        axisD.resize(nD);  for (auto& v : axisD)  f >> v;
+        axisL.resize(nL);  for (auto& v : axisL)  f >> v;
+
+        size_t total = (size_t)nZ*nV*nM*nD*nL;
+        data.resize(total);
+
+        for (size_t i = 0; i < total; i++)
+            f >> data[i].t >> data[i].hDist;
+
+        return f.good();
+    }
+    struct Interp {
+    int lo;
+    float frac;
+};
+
+Interp findInterp(float val, const std::vector<float>& axis) const {
+    if (val <= axis.front()) return {0, 0.0f};
+    if (val >= axis.back())  return {(int)axis.size()-2, 1.0f};
+    int i = 0;
+    for (int j = 0; j < (int)axis.size()-1; j++)
+        if (axis[j] <= val && val <= axis[j+1]) { i = j; break; }
+    float frac = (val - axis[i]) / (axis[i+1] - axis[i]);
+    return {i, frac};
+}
+
+Result lerp(const Result& a, const Result& b, float t) const {
+    return {a.t + (b.t - a.t) * t, a.hDist + (b.hDist - a.hDist) * t};
+}
+
+Result lookup(float Z0, float V0, float m, float d, float l) const {
+    Interp iz = findInterp(Z0, axisZ0);
+    Interp iv = findInterp(V0, axisV0);
+    Interp im = findInterp(m,  axisM);
+    Interp id = findInterp(d,  axisD);
+    Interp il = findInterp(l,  axisL);
+
+    Result v[16];
+    for (int a = 0; a < 2; a++)
+    for (int b = 0; b < 2; b++)
+    for (int c = 0; c < 2; c++)
+    for (int e = 0; e < 2; e++) {
+        auto& lo = at(iz.lo+a, iv.lo+b, im.lo+c, id.lo+e, il.lo);
+        auto& hi = at(iz.lo+a, iv.lo+b, im.lo+c, id.lo+e, il.lo+1);
+        v[a*8+b*4+c*2+e] = lerp(lo, hi, il.frac);
+    }
+    Result w[8];
+    for (int a = 0; a < 2; a++)
+    for (int b = 0; b < 2; b++)
+    for (int c = 0; c < 2; c++)
+        w[a*4+b*2+c] = lerp(v[a*8+b*4+c*2], v[a*8+b*4+c*2+1], id.frac);
+
+    Result u[4];
+    for (int a = 0; a < 2; a++)
+    for (int b = 0; b < 2; b++)
+        u[a*2+b] = lerp(w[a*4+b*2], w[a*4+b*2+1], im.frac);
+
+    Result s[2];
+    for (int a = 0; a < 2; a++)
+        s[a] = lerp(u[a*2], u[a*2+1], iv.frac);
+
+    return lerp(s[0], s[1], iz.frac);
+}
+};
+
+class IDroneState {
+public:
+    virtual ~IDroneState() = default;
+    virtual std::unique_ptr<IDroneState> execute(DroneContext& ctx) = 0;
+    virtual const char* name() const = 0;
+};
+
+
+
+
+class StateStopped;
+class StateAccelerating;
+class StateDecelerating;
+class StateTurning;
+class StateMoving;
+
+class StateStopped : public IDroneState {
+public:
+    std::unique_ptr<IDroneState> execute(DroneContext& ctx) override;
+    const char* name() const override { return "Stopped"; }
+};
+
+class StateAccelerating : public IDroneState {
+public:
+    std::unique_ptr<IDroneState> execute(DroneContext& ctx) override;
+    const char* name() const override { return "Accelerating"; }
+};
+
+class StateDecelerating : public IDroneState {
+public:
+    std::unique_ptr<IDroneState> execute(DroneContext& ctx) override;
+    const char* name() const override { return "Decelerating"; }
+};
+
+class StateTurning : public IDroneState {
+public:
+    std::unique_ptr<IDroneState> execute(DroneContext& ctx) override;
+    const char* name() const override { return "Turning"; }
+};
+
+class StateMoving : public IDroneState {
+public:
+    std::unique_ptr<IDroneState> execute(DroneContext& ctx) override;
+    const char* name() const override { return "Moving"; }
+};
+
+std::unique_ptr<IDroneState> StateStopped::execute(DroneContext& ctx) {
+    ctx.droneDir = ctx.newDir;
+    return std::make_unique<StateAccelerating>();
+}
+
+std::unique_ptr<IDroneState> StateAccelerating::execute(DroneContext& ctx) {
+    ctx.droneSpeed += ctx.accel * ctx.simTimeStep;
+    if (ctx.droneSpeed >= ctx.attackSpeed) {
+        ctx.droneSpeed = ctx.attackSpeed;
+        ctx.dronePos.x += ctx.droneSpeed * cosf(ctx.droneDir) * ctx.simTimeStep;
+        ctx.dronePos.y += ctx.droneSpeed * sinf(ctx.droneDir) * ctx.simTimeStep;
+        return std::make_unique<StateMoving>();
+    }
+    ctx.dronePos.x += ctx.droneSpeed * cosf(ctx.droneDir) * ctx.simTimeStep;
+    ctx.dronePos.y += ctx.droneSpeed * sinf(ctx.droneDir) * ctx.simTimeStep;
+    return nullptr;
+}
+
+std::unique_ptr<IDroneState> StateMoving::execute(DroneContext& ctx) {
+    if (fabsf(ctx.deltaAngle) > ctx.turnThreshold) {
+        ctx.dronePos.x += ctx.droneSpeed * cosf(ctx.droneDir) * ctx.simTimeStep;
+        ctx.dronePos.y += ctx.droneSpeed * sinf(ctx.droneDir) * ctx.simTimeStep;
+        return std::make_unique<StateDecelerating>();
+    }
+    ctx.droneDir = ctx.newDir;
+    ctx.dronePos.x += ctx.droneSpeed * cosf(ctx.droneDir) * ctx.simTimeStep;
+    ctx.dronePos.y += ctx.droneSpeed * sinf(ctx.droneDir) * ctx.simTimeStep;
+    return nullptr;
+}
+
+std::unique_ptr<IDroneState> StateDecelerating::execute(DroneContext& ctx) {
+    ctx.droneSpeed -= ctx.accel * ctx.simTimeStep;
+    if (ctx.droneSpeed <= 0) {
+        ctx.droneSpeed = 0;
+        return std::make_unique<StateTurning>();
+    }
+    ctx.dronePos.x += ctx.droneSpeed * cosf(ctx.droneDir) * ctx.simTimeStep;
+    ctx.dronePos.y += ctx.droneSpeed * sinf(ctx.droneDir) * ctx.simTimeStep;
+    return nullptr;
+}
+
+std::unique_ptr<IDroneState> StateTurning::execute(DroneContext& ctx) {
+    float turnAmount = ctx.angularSpeed * ctx.simTimeStep;
+    if (fabsf(ctx.deltaAngle) <= turnAmount) {
+        ctx.droneDir = ctx.newDir;
+        return std::make_unique<StateAccelerating>();
+    }
+    ctx.droneDir += (ctx.deltaAngle > 0) ? turnAmount : -turnAmount;
+    return nullptr;
+}
+
+
+
+Coord interpolateTarget(const Coord* targetRow, 
+                         float t, float arrayTimeStep, int timeSteps) {
+    int idx  = (int)(t / arrayTimeStep) % timeSteps;
+    int next = (idx + 1) % timeSteps;
+    float frac = (t - (int)(t / arrayTimeStep) * arrayTimeStep) / arrayTimeStep;
+    Coord result;
+    result.x = targetRow[idx].x + (targetRow[next].x - targetRow[idx].x) * frac;
+    result.y = targetRow[idx].y + (targetRow[next].y - targetRow[idx].y) * frac;
+    return result;
+}
+
+
+Coord calcFirePoint(Coord dronePos, Coord targetPos,
+                    float h, float accelPath) {
+    Coord delta = targetPos - dronePos;
+    float D = length(delta);
+    Coord dir = normalize(delta);
+
+    if (h + accelPath > D) {
+        
+        return targetPos - dir * h;
+    }
+    return dronePos + dir * (D - h);
+}
+
+
+//  DronePhysics 
+
+struct DroneCommand {
+    float desiredDir;  // бажаний напрямок польоту
+};
+
+struct DroneTelemetry {
+    Coord pos;
+    float timeSecSinceStart;
+};
+
+template<typename T>
+class ThreadSafeQueue {
+private:
+    mutable std::mutex mtx_;
+    std::queue<T> queue_;
+
+public:
+    void push(const T& item) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        queue_.push(item);
+    }
+
+    bool tryPop(T& out) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (queue_.empty()) return false;
+        out = queue_.front();
+        queue_.pop();
+        return true;
+    }
+};
+
+class DronePhysics {
+private:
+    mutable std::mutex mtx_;
+
+    Coord dronePos_;
+    float droneDir_;
+    float droneSpeed_;
+    std::unique_ptr<IDroneState> droneState_;
+    float desiredDir_ = 0.0f;
+
+    float accel_;
+    float angularSpeed_;
+    float turnThreshold_;
+    float attackSpeed_;
+
+    float physicsTimeStep_ = 0.01f; 
+    float timeScale_ = 1.0f; // 1.0 це дефолтне значення, реальне зчитується з config.json  і зараз дорівнює 10.0
+    float elapsedTime_ = 0.0f;
+
+    std::atomic<bool> threadReady_{false};
+    std::atomic<bool> shouldRun_{false};
+    std::atomic<bool> stopFlag_{false};
+
+    ThreadSafeQueue<DroneCommand> commandQueue_;
+
+public:
+    DronePhysics(Coord startPos, float initialDir, float accel,
+                 float angularSpeed, float turnThreshold, float attackSpeed)
+        : dronePos_(startPos)
+        , droneDir_(initialDir)
+        , droneSpeed_(0.0f)
+        , droneState_(std::make_unique<StateStopped>())
+        , desiredDir_(initialDir)
+        , accel_(accel)
+        , angularSpeed_(angularSpeed)
+        , turnThreshold_(turnThreshold)
+        , attackSpeed_(attackSpeed)
+    {}
+
+    void setPhysicsTimeStep(float step) { physicsTimeStep_ = step; }
+    void setTimeScale(float scale) { timeScale_ = scale; }
+
+    void setCommand(const DroneCommand& cmd) {
+        commandQueue_.push(cmd);
+    }
+
+   void step(float dt) {
+        DroneCommand cmd;
+        while (commandQueue_.tryPop(cmd)) {
+            std::lock_guard<std::mutex> lock(mtx_);
+            desiredDir_ = cmd.desiredDir;
+        }
+
+        std::lock_guard<std::mutex> lock(mtx_);
+
+        float deltaAngle = desiredDir_ - droneDir_;
+        while (deltaAngle >  3.14159f) deltaAngle -= 2*3.14159f;
+        while (deltaAngle < -3.14159f) deltaAngle += 2*3.14159f;
+
+        DroneContext ctx;
+        ctx.dronePos      = dronePos_;
+        ctx.droneDir      = droneDir_;
+        ctx.droneSpeed    = droneSpeed_;
+        ctx.newDir        = desiredDir_;
+        ctx.deltaAngle    = deltaAngle;
+        ctx.attackSpeed   = attackSpeed_;
+        ctx.accel         = accel_;
+        ctx.angularSpeed  = angularSpeed_;
+        ctx.turnThreshold = turnThreshold_;
+        ctx.simTimeStep   = dt;
+
+        auto next = droneState_->execute(ctx);
+        if (next) droneState_ = std::move(next);
+
+        dronePos_   = ctx.dronePos;
+        droneDir_   = ctx.droneDir;
+        droneSpeed_ = ctx.droneSpeed;
+       
+        elapsedTime_ += dt;
+    }
+    
+  
+    void run() {
+    threadReady_ = true;
+
+    while (!shouldRun_ && !stopFlag_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    while (!stopFlag_) {
+        step(physicsTimeStep_);
+
+        std::this_thread::sleep_for(
+            std::chrono::duration<float>(physicsTimeStep_ / timeScale_));
+    }
+}
+    bool isThreadReady() const { return threadReady_; }
+    void start() { shouldRun_ = true; }
+    void stop() { stopFlag_ = true; }
+
+    DroneTelemetry getTelemetry() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        DroneTelemetry t;
+        t.pos = dronePos_;
+        t.timeSecSinceStart = elapsedTime_;
+        return t;
+    }
+
+    float getDirection() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return droneDir_;
+    }
+
+    const char* getStateName() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return droneState_->name();
+    }
+};
+
+//ThreadSafeTargetProvider
+class ThreadSafeTargetProvider {
+private:
+std::unique_ptr<std::unique_ptr<Coord[]>[]> trajectories_;
+int targetCount_;
+    int timeSteps_;
+    float arrayTimeStep_;
+
+    mutable std::mutex mtx_;
+    std::unique_ptr<Target[]> currentTargets_;
+    std::unique_ptr<Coord[]> prevVelocities_;
+    bool hasPrevVelocity_ = false;
+    float targetTimeStep_ = 0.05f;
+    float timeScale_ = 1.0f;
+
+    std::atomic<bool> threadReady_{false};
+    std::atomic<bool> shouldRun_{false};
+    std::atomic<bool> stopFlag_{false};
+
+public:
+    ThreadSafeTargetProvider(const char* path) {
+        std::ifstream ft(path);
+        if (!ft.is_open()) {
+            std::cerr << "Cannot open " << path << std::endl;
+            std::exit(1);
+        }
+        json jt;
+        ft >> jt;
+
+        targetCount_   = jt["targetCount"];
+        timeSteps_     = jt["timeSteps"];
+        arrayTimeStep_ = 1.0f;
+
+        trajectories_ = std::make_unique<std::unique_ptr<Coord[]>[]>(targetCount_);
+        for (int i = 0; i < targetCount_; i++) {
+           trajectories_[i] = std::make_unique<Coord[]>(timeSteps_);
+           for (int j = 0; j < timeSteps_; j++) {
+              trajectories_[i][j].x = jt["targets"][i]["positions"][j]["x"];
+              trajectories_[i][j].y = jt["targets"][i]["positions"][j]["y"];
+    }
+}
+
+        currentTargets_.reset(new Target[targetCount_]);
+        prevVelocities_.reset(new Coord[targetCount_]);
+    }
+
+   
+
+    void setArrayTimeStep(float step) { arrayTimeStep_ = step; }
+    void setTargetTimeStep(float step) { targetTimeStep_ = step; }
+    void setTimeScale(float scale) { timeScale_ = scale; }
+
+  void step(float currentTime) {
+    const float velDt = 0.1f;  
+    for (int i = 0; i < targetCount_; i++) {
+        Coord pos  = interpolateTarget(trajectories_[i].get(), currentTime,          arrayTimeStep_, timeSteps_);
+        Coord next = interpolateTarget(trajectories_[i].get(), currentTime + velDt,  arrayTimeStep_, timeSteps_);
+        Coord vel  = (next - pos) * (1.0f / velDt);
+
+        Coord acc{0.0f, 0.0f};
+        if (hasPrevVelocity_) {
+            acc = (vel - prevVelocities_[i]) * (1.0f / targetTimeStep_);
+        }
+        prevVelocities_[i] = vel;
+
+        std::lock_guard<std::mutex> lock(mtx_);
+        currentTargets_[i].pos      = pos;
+        currentTargets_[i].velocity = vel;
+        currentTargets_[i].accel    = acc;
+    }
+    hasPrevVelocity_ = true;
+}
+
+    void run() {
+        threadReady_ = true;
+
+        while (!shouldRun_ && !stopFlag_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        float currentTime = 0.0f;
+        while (!stopFlag_) {
+            step(currentTime);
+            currentTime += targetTimeStep_;
+
+            std::this_thread::sleep_for(
+                std::chrono::duration<float>(targetTimeStep_ / timeScale_));
+        }
+    }
+
+    bool isThreadReady() const { return threadReady_; }
+    void start() { shouldRun_ = true; }
+    void stop() { stopFlag_ = true; }
+
+    int getTargetCount() const { return targetCount_; }
+
+    Target getTarget(int idx) const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return currentTargets_[idx];
+    }
+};
+
+class MissionProcessor {
+private:
+    DronePhysics& physics_;
+    ThreadSafeTargetProvider& provider_;
+    BallisticTable& table_;
+    AmmoParams* ammo_;
+    int bombIdx_;
+    DroneConfig config_;
+
+    static const int MAX_STEPS = 10000;
+    std::unique_ptr<SimStep[]> steps_;
+    int stepCount_ = 0;
+
+    std::atomic<bool> threadReady_{false};
+    std::atomic<bool> shouldRun_{false};
+    std::atomic<bool> stopFlag_{false};
+    float timeScale_ = 1.0f;  // дефолт; реальне значення зчитується з config.json ("simulation.timeScale")
+
+
+public:
+    MissionProcessor(DronePhysics& physics, ThreadSafeTargetProvider& provider,
+                      BallisticTable& table, AmmoParams* ammo, int bombIdx,
+                      const DroneConfig& config)
+        : physics_(physics)
+        , provider_(provider)
+        , table_(table)
+        , ammo_(ammo)
+        , bombIdx_(bombIdx)
+        , config_(config)
+        , steps_(new SimStep[MAX_STEPS])
+    {}
+
+    void run() {
+        threadReady_ = true;
+
+        while (!shouldRun_ && !stopFlag_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        float currentTime = 0.0f;
+        int currentTarget = -1;
+
+        while (stepCount_ < MAX_STEPS && !stopFlag_) {
+            DroneTelemetry telemetry = physics_.getTelemetry();
+            Coord dronePos = telemetry.pos;
+            float bestTime = -1.0f;
+            int bestTarget = -1;
+
+            for (int i = 0; i < provider_.getTargetCount(); i++) {
+                Target tgt = provider_.getTarget(i);
+                Coord tPos = tgt.pos;
+                Coord tVel = tgt.velocity;
+                auto res = table_.lookup(config_.altitude, config_.attackSpeed,
+                                          ammo_[bombIdx_].mass, ammo_[bombIdx_].drag, ammo_[bombIdx_].lift);
+                float ft = res.t;
+                float h = res.hDist;
+                Coord predicted = tPos + tVel * ft + tgt.accel * (0.5f * ft * ft);
+                Coord firePoint = calcFirePoint(dronePos, predicted, h, config_.accelPath);
+                float dist = length(firePoint - dronePos);
+                float totalTime = ft + dist / config_.attackSpeed;
+
+                if (bestTime < 0 || totalTime < bestTime) {
+                    bestTime = totalTime;
+                    bestTarget = i;
+                }
+            }
+            currentTarget = bestTarget;
+
+            Target tgt2 = provider_.getTarget(currentTarget);
+            Coord tPos = tgt2.pos;
+            Coord tVel = tgt2.velocity;
+            auto res = table_.lookup(config_.altitude, config_.attackSpeed,
+                                      ammo_[bombIdx_].mass, ammo_[bombIdx_].drag, ammo_[bombIdx_].lift);
+            float ft = res.t;
+            float h = res.hDist;
+            Coord predicted = tPos + tVel * ft + tgt2.accel * (0.5f * ft * ft);
+            Coord firePoint = calcFirePoint(dronePos, predicted, h, config_.accelPath);
+
+            float newDir = atan2f(firePoint.y - dronePos.y, firePoint.x - dronePos.x);
+
+            steps_[stepCount_].pos             = dronePos;
+            steps_[stepCount_].direction       = physics_.getDirection();
+            steps_[stepCount_].stateName       = physics_.getStateName();
+            steps_[stepCount_].targetIdx       = currentTarget;
+            steps_[stepCount_].dropPoint       = firePoint;
+            steps_[stepCount_].aimPoint        = dronePos + Coord{cosf(physics_.getDirection()), sinf(physics_.getDirection())} * h;
+            steps_[stepCount_].predictedTarget = predicted;
+            steps_[stepCount_].timeSecSinceStart = telemetry.timeSecSinceStart;
+
+            physics_.setCommand({newDir});
+
+            
+            DroneTelemetry telAfter = physics_.getTelemetry();   // ОДИН знімок: і позиція, і час разом
+            Coord dronePosAfter = telAfter.pos;
+            float distToFire = length(firePoint - dronePosAfter);
+            float navEpsilon = config_.attackSpeed * config_.simTimeStep;  // відстань за один крок планування
+
+            if (distToFire <= navEpsilon && std::string(physics_.getStateName()) == "Moving") {
+                float finalDir = atan2f(firePoint.y - dronePosAfter.y, firePoint.x - dronePosAfter.x);
+                steps_[stepCount_].pos               = dronePosAfter;
+                steps_[stepCount_].direction         = physics_.getDirection();
+                steps_[stepCount_].timeSecSinceStart = telAfter.timeSecSinceStart;
+                steps_[stepCount_].aimPoint          = dronePosAfter + Coord{cosf(finalDir), sinf(finalDir)} * h;
+                stepCount_++;
+                stopFlag_ = true;
+                break;
+            }
+
+
+            stepCount_++;
+            currentTime += config_.simTimeStep;
+            std::this_thread::sleep_for(std::chrono::duration<float>(config_.simTimeStep / timeScale_));
+        }
+    }
+
+    bool isThreadReady() const { return threadReady_; }
+    void start() { shouldRun_ = true; }
+    void stop() { stopFlag_ = true; }
+    void setTimeScale(float scale) { timeScale_ = scale; }
+
+
+    int getStepCount() const { return stepCount_; }
+    const SimStep* getSteps() const { return steps_.get(); }
+};
+        
+
+   
+int main() {
+    std::ifstream fc("config.json");
+    if (!fc.is_open()) {
+        std::cerr << "Cannot open config.json" << std::endl;
+        return 1;
+    }
+    json jc;
+    fc >> jc;
+
+    DroneConfig config;
+    config.startPos.x   = jc["drone"]["position"]["x"];
+    config.startPos.y   = jc["drone"]["position"]["y"];
+    config.altitude     = jc["drone"]["altitude"];
+    config.initialDir   = jc["drone"]["initialDirection"];
+    config.attackSpeed  = jc["drone"]["attackSpeed"];
+    config.accelPath    = jc["drone"]["accelerationPath"];
+    config.angularSpeed = jc["drone"]["angularSpeed"];
+    config.turnThreshold= jc["drone"]["turnThreshold"];
+    config.simTimeStep  = jc["simulation"]["timeStep"];
+    config.hitRadius    = jc["simulation"]["hitRadius"];
+    config.arrayTimeStep= jc["targetArrayTimeStep"];
+    std::strncpy(config.ammoName, jc["ammo"].get<std::string>().c_str(), 31);
+
+    LOG("Config loaded: speed=" << config.attackSpeed);
+
+    std::ifstream fa("ammo.json");
+    json ja;
+    fa >> ja;
+
+    int ammoCount = ja.size();
+
+    std::unique_ptr<AmmoParams[]> ammo(new AmmoParams[ammoCount]);
+    for (int i = 0; i < ammoCount; ++i) {
+        ammo[i].mass = ja[i]["mass"];
+        ammo[i].drag = ja[i]["drag"];
+        ammo[i].lift = ja[i]["lift"];
+        std::strncpy(ammo[i].name, ja[i]["name"].get<std::string>().c_str(), 31);
+    }
+    LOG("Ammo loaded: " << ammoCount << " types");
+
+    BallisticTable table;
+    if (!table.load("ballistic_table.txt")) {
+        std::cerr << "Cannot open ballistic_table.txt" << std::endl;
+        return 1;
+    }
+    float targetTimeStep  = jc["simulation"].value("targetTimeStep",  0.05f);
+    float physicsTimeStep = jc["simulation"].value("physicsTimeStep", 0.01f);
+    float timeScale       = jc["simulation"].value("timeScale",       1.0f);
+    LOG("Ballistic table loaded");
+
+    ThreadSafeTargetProvider provider("targets.json");
+    provider.setArrayTimeStep(config.arrayTimeStep);
+    provider.setTargetTimeStep(targetTimeStep);
+    provider.setTimeScale(timeScale);
+    LOG("Targets loaded: " << provider.getTargetCount());
+
+    int bombIdx = -1;
+    for (int i = 0; i < ammoCount; i++) {
+        if (strcmp(ammo[i].name, config.ammoName) == 0) {
+            bombIdx = i;
+            break;
+        }
+    }
+    if (bombIdx == -1) {
+        std::cerr << "Unknown ammo: " << config.ammoName << std::endl;
+        return 1;
+    }
+    LOG("Ammo found: " << ammo[bombIdx].name);
+
+    float accel = (config.attackSpeed * config.attackSpeed) / (2.0f * config.accelPath);
+    DronePhysics physics(config.startPos, config.initialDir, accel,
+                          config.angularSpeed, config.turnThreshold, config.attackSpeed);
+    physics.setPhysicsTimeStep(physicsTimeStep);
+    physics.setTimeScale(timeScale);
+    MissionProcessor mission(physics, provider, table, ammo.get(), bombIdx, config);
+    mission.setTimeScale(timeScale);
+
+    std::thread providerThread(&ThreadSafeTargetProvider::run, &provider);
+    std::thread physicsThread(&DronePhysics::run, &physics);
+    std::thread missionThread(&MissionProcessor::run, &mission);
+
+    while (!provider.isThreadReady() || !physics.isThreadReady() || !mission.isThreadReady())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    provider.start();
+    physics.start();
+    mission.start();
+
+    missionThread.join();
+    physics.stop();
+    provider.stop();
+    providerThread.join();
+    physicsThread.join();
+
+    LOG("Simulation complete. Steps: " << mission.getStepCount());
+
+    json out;
+    out["totalSteps"] = mission.getStepCount();
+    out["steps"] = json::array();
+    const SimStep* steps = mission.getSteps();
+    for (int i = 0; i < mission.getStepCount(); i++) {
+        json step;
+        step["position"]        = {{"x", steps[i].pos.x}, {"y", steps[i].pos.y}};
+        step["direction"]       = steps[i].direction;
+        step["state"]           = steps[i].stateName;
+        step["targetIndex"]     = steps[i].targetIdx;
+        step["dropPoint"]       = {{"x", steps[i].dropPoint.x}, {"y", steps[i].dropPoint.y}};
+        step["aimPoint"]        = {{"x", steps[i].aimPoint.x}, {"y", steps[i].aimPoint.y}};
+        step["predictedTarget"] = {{"x", steps[i].predictedTarget.x}, {"y", steps[i].predictedTarget.y}};
+        step["timeSecSinceStart"] = steps[i].timeSecSinceStart;
+
+        out["steps"].push_back(step);
+    }
+    std::ofstream fout("simulation.json");
+    fout << out.dump(2);
+    fout.close();
+    LOG("simulation.json written");
+
+    return 0;
+}
