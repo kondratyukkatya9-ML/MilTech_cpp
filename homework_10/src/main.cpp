@@ -13,7 +13,7 @@
 using json = nlohmann::json;
 
 
-#define ENABLE_LOG   1
+#define ENABLE_LOG   0
 #define ENABLE_DEBUG 0
 
 #if ENABLE_LOG
@@ -96,7 +96,7 @@ struct DroneConfig {
 struct SimStep {
     Coord pos;
     float direction;
-    int   state;
+    
     std::string stateName;
     int   targetIdx;
     Coord dropPoint;
@@ -112,18 +112,12 @@ struct Target {
 
 };
 
-enum DroneState {
-    STOPPED,
-    ACCELERATING,
-    DECELERATING,
-    TURNING,
-    MOVING
-};
+
 struct DroneContext {
     Coord dronePos;
     float droneDir;
     float droneSpeed;
-    DroneState droneState;
+
 
     float newDir;
     float deltaAngle;
@@ -334,41 +328,18 @@ std::unique_ptr<IDroneState> StateTurning::execute(DroneContext& ctx) {
 
 
 
-Coord interpolateTarget(Coord** targets, int targetIdx, 
+Coord interpolateTarget(const Coord* targetRow, 
                          float t, float arrayTimeStep, int timeSteps) {
     int idx  = (int)(t / arrayTimeStep) % timeSteps;
     int next = (idx + 1) % timeSteps;
     float frac = (t - (int)(t / arrayTimeStep) * arrayTimeStep) / arrayTimeStep;
     Coord result;
-    result.x = targets[targetIdx][idx].x + 
-               (targets[targetIdx][next].x - targets[targetIdx][idx].x) * frac;
-    result.y = targets[targetIdx][idx].y + 
-               (targets[targetIdx][next].y - targets[targetIdx][idx].y) * frac;
+    result.x = targetRow[idx].x + (targetRow[next].x - targetRow[idx].x) * frac;
+    result.y = targetRow[idx].y + (targetRow[next].y - targetRow[idx].y) * frac;
     return result;
 }
-float calcFlightTime(float zd, float V0, float m, float d, float l) {
-    float g = 9.81f;
-    float a = d*g*m - 2*d*d*l*V0;
-    float b = -3*g*m*m + 3*d*l*m*V0;
-    float c = 6*m*m*zd;
-    float p = -(b*b) / (3*a*a);
-    float q = 2*b*b*b / (27*a*a*a) + c/a;
-    float arg = 3*q / (2*p) * sqrtf(-3/p);
-    if (arg < -1.0f || arg > 1.0f) return -1.0f;
-    float phi = acosf(arg);
-    return 2*sqrtf(-p/3) * cosf((phi + 4*3.14159f) / 3) - b/(3*a);
-}
 
-float calcHorizDist(float t, float V0, float m, float d, float l) {
-    float g = 9.81f;
-    float l2 = l*l;
-    float l4 = l2*l2;
-    return V0*t
-        - t*t*d*V0/(2*m)
-        + t*t*t*(6*d*g*l*m - 6*d*d*(l2-1)*V0)/(36*m*m)
-        + t*t*t*t*(-6*d*d*g*l*(1+l2+l4)*m + 3*d*d*d*l2*(1+l2)*V0 + 6*d*d*d*l4*(1+l2)*V0)/(36*(1+l2)*(1+l2)*m*m*m)
-        + t*t*t*t*t*(3*d*d*d*g*l*l*l*m - 3*d*d*d*d*l2*(1+l2)*V0)/(36*(1+l2)*m*m*m*m);
-}
+
 Coord calcFirePoint(Coord dronePos, Coord targetPos,
                     float h, float accelPath) {
     Coord delta = targetPos - dronePos;
@@ -381,55 +352,8 @@ Coord calcFirePoint(Coord dronePos, Coord targetPos,
     }
     return dronePos + dir * (D - h);
 }
-float calcTimeToStop(DroneState state, float speed, 
-                     float attackSpeed, float accel) {
-    if (state == ACCELERATING) return speed / accel;
-    if (state == MOVING)       return attackSpeed / accel;
-    return 0.0f;
-}
 
-void updateDrone(Coord& dronePos, float& droneDir,
-                 float& droneSpeed, DroneState& droneState,
-                 float newDir, float deltaAngle,
-                 float attackSpeed, float accel,
-                 float angularSpeed, float turnThreshold, 
-                 float simTimeStep) {
-    if (droneState == STOPPED) {
-        droneDir   = newDir;
-        droneState = ACCELERATING;
-    } else if (droneState == ACCELERATING) {
-        droneSpeed += accel * simTimeStep;
-        if (droneSpeed >= attackSpeed) {
-            droneSpeed = attackSpeed;
-            droneState = MOVING;
-        }
-        dronePos.x += droneSpeed * cosf(droneDir) * simTimeStep;
-        dronePos.y += droneSpeed * sinf(droneDir) * simTimeStep;
-    } else if (droneState == MOVING) {
-        if (fabsf(deltaAngle) > turnThreshold)
-            droneState = DECELERATING;
-        else
-            droneDir = newDir;
-        dronePos.x += droneSpeed * cosf(droneDir) * simTimeStep;
-        dronePos.y += droneSpeed * sinf(droneDir) * simTimeStep;
-    } else if (droneState == DECELERATING) {
-        droneSpeed -= accel * simTimeStep;
-        if (droneSpeed <= 0) {
-            droneSpeed = 0;
-            droneState = TURNING;
-        }
-        dronePos.x += droneSpeed * cosf(droneDir) * simTimeStep;
-        dronePos.y += droneSpeed * sinf(droneDir) * simTimeStep;
-    } else if (droneState == TURNING) {
-        float turnAmount = angularSpeed * simTimeStep;
-        if (fabsf(deltaAngle) <= turnAmount) {
-            droneDir   = newDir;
-            droneState = ACCELERATING;
-        } else {
-            droneDir += (deltaAngle > 0) ? turnAmount : -turnAmount;
-        }
-    }
-}
+
 //  DronePhysics 
 
 struct DroneCommand {
@@ -438,7 +362,6 @@ struct DroneCommand {
 
 struct DroneTelemetry {
     Coord pos;
-    Coord speed;
     float timeSecSinceStart;
 };
 
@@ -461,12 +384,8 @@ public:
         queue_.pop();
         return true;
     }
-
-    bool empty() const {
-        std::lock_guard<std::mutex> lock(mtx_);
-        return queue_.empty();
-    }
 };
+
 class DronePhysics {
 private:
     mutable std::mutex mtx_;
@@ -544,9 +463,7 @@ public:
         dronePos_   = ctx.dronePos;
         droneDir_   = ctx.droneDir;
         droneSpeed_ = ctx.droneSpeed;
-        dronePos_   = ctx.dronePos;
-        droneDir_   = ctx.droneDir;
-        droneSpeed_ = ctx.droneSpeed;
+       
         elapsedTime_ += dt;
     }
     
@@ -573,7 +490,6 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         DroneTelemetry t;
         t.pos = dronePos_;
-        t.speed = Coord{ droneSpeed_ * cosf(droneDir_), droneSpeed_ * sinf(droneDir_) };
         t.timeSecSinceStart = elapsedTime_;
         return t;
     }
@@ -592,8 +508,8 @@ public:
 //ThreadSafeTargetProvider
 class ThreadSafeTargetProvider {
 private:
-    std::unique_ptr<Coord*[]> trajectories_;
-    int targetCount_;
+std::unique_ptr<std::unique_ptr<Coord[]>[]> trajectories_;
+int targetCount_;
     int timeSteps_;
     float arrayTimeStep_;
 
@@ -622,48 +538,45 @@ public:
         timeSteps_     = jt["timeSteps"];
         arrayTimeStep_ = 1.0f;
 
-        trajectories_.reset(new Coord*[targetCount_]);
+        trajectories_ = std::make_unique<std::unique_ptr<Coord[]>[]>(targetCount_);
         for (int i = 0; i < targetCount_; i++) {
-            trajectories_[i] = new Coord[timeSteps_];
-            for (int j = 0; j < timeSteps_; j++) {
-                trajectories_[i][j].x = jt["targets"][i]["positions"][j]["x"];
-                trajectories_[i][j].y = jt["targets"][i]["positions"][j]["y"];
-            }
-        }
+           trajectories_[i] = std::make_unique<Coord[]>(timeSteps_);
+           for (int j = 0; j < timeSteps_; j++) {
+              trajectories_[i][j].x = jt["targets"][i]["positions"][j]["x"];
+              trajectories_[i][j].y = jt["targets"][i]["positions"][j]["y"];
+    }
+}
 
         currentTargets_.reset(new Target[targetCount_]);
         prevVelocities_.reset(new Coord[targetCount_]);
     }
 
-    ~ThreadSafeTargetProvider() {
-        for (int i = 0; i < targetCount_; i++)
-            delete[] trajectories_[i];
-    }
+   
 
     void setArrayTimeStep(float step) { arrayTimeStep_ = step; }
     void setTargetTimeStep(float step) { targetTimeStep_ = step; }
     void setTimeScale(float scale) { timeScale_ = scale; }
 
-   void step(float currentTime) {
-        float dt = arrayTimeStep_;
-        for (int i = 0; i < targetCount_; i++) {
-            Coord pos  = interpolateTarget(trajectories_.get(), i, currentTime,      arrayTimeStep_, timeSteps_);
-            Coord next = interpolateTarget(trajectories_.get(), i, currentTime + dt, arrayTimeStep_, timeSteps_);
-            Coord vel  = (next - pos) * (1.0f / dt);
+  void step(float currentTime) {
+    const float velDt = 0.1f;  
+    for (int i = 0; i < targetCount_; i++) {
+        Coord pos  = interpolateTarget(trajectories_[i].get(), currentTime,          arrayTimeStep_, timeSteps_);
+        Coord next = interpolateTarget(trajectories_[i].get(), currentTime + velDt,  arrayTimeStep_, timeSteps_);
+        Coord vel  = (next - pos) * (1.0f / velDt);
 
-            Coord acc{0.0f, 0.0f};
-            if (hasPrevVelocity_) {
-                acc = (vel - prevVelocities_[i]) * (1.0f / targetTimeStep_);
-            }
-            prevVelocities_[i] = vel;
-
-            std::lock_guard<std::mutex> lock(mtx_);
-            currentTargets_[i].pos      = pos;
-            currentTargets_[i].velocity = vel;
-            currentTargets_[i].accel    = acc;
+        Coord acc{0.0f, 0.0f};
+        if (hasPrevVelocity_) {
+            acc = (vel - prevVelocities_[i]) * (1.0f / targetTimeStep_);
         }
-        hasPrevVelocity_ = true;
+        prevVelocities_[i] = vel;
+
+        std::lock_guard<std::mutex> lock(mtx_);
+        currentTargets_[i].pos      = pos;
+        currentTargets_[i].velocity = vel;
+        currentTargets_[i].accel    = acc;
     }
+    hasPrevVelocity_ = true;
+}
 
     void run() {
         threadReady_ = true;
@@ -785,24 +698,22 @@ public:
 
             physics_.setCommand({newDir});
 
-            //Coord dronePosAfter = physics_.getTelemetry().pos;
-            //float distToFire = length(firePoint - dronePosAfter);
-            //if (distToFire <= config_.hitRadius && std::string(physics_.getStateName()) == "Moving") {
-            //    stopFlag_ = true;
-            //    break;
-            //}
-            Coord dronePosAfter = physics_.getTelemetry().pos;
+            
+            DroneTelemetry telAfter = physics_.getTelemetry();   // ОДИН знімок: і позиція, і час разом
+            Coord dronePosAfter = telAfter.pos;
             float distToFire = length(firePoint - dronePosAfter);
-            float navEpsilon = config_.attackSpeed * config_.simTimeStep;  // відстань за один крок планування, замість hitRadius
+            float navEpsilon = config_.attackSpeed * config_.simTimeStep;  // відстань за один крок планування
+
             if (distToFire <= navEpsilon && std::string(physics_.getStateName()) == "Moving") {
                 float finalDir = atan2f(firePoint.y - dronePosAfter.y, firePoint.x - dronePosAfter.x);
-                steps_[stepCount_].pos       = dronePosAfter;
-                steps_[stepCount_].direction = physics_.getDirection();
-                steps_[stepCount_].aimPoint  = dronePosAfter + Coord{cosf(finalDir), sinf(finalDir)} * h;
-
+                steps_[stepCount_].pos               = dronePosAfter;
+                steps_[stepCount_].direction         = physics_.getDirection();
+                steps_[stepCount_].timeSecSinceStart = telAfter.timeSecSinceStart;
+                steps_[stepCount_].aimPoint          = dronePosAfter + Coord{cosf(finalDir), sinf(finalDir)} * h;
+                stepCount_++;
                 stopFlag_ = true;
                 break;
-        }
+            }
 
 
             stepCount_++;
